@@ -1281,13 +1281,31 @@ function chargeTotals(){ if (CHG) return CHG; CHG={}; allExpenses().forEach(e=>{
 const pendingCharges = id => (chargeTotals()[id]?.pending)||0;
 const chargeCredit = d => Math.max(0, ((chargeTotals()[d.id]?.all)||0) - num(d.chargeRepaid));
 function markBilled(id){ allExpenses().forEach(e=>{ if(e.charge===id) e.billed=true; }); CHG=null; }
+// Every credit card can take new purchases. A card added only as an installment / balance conversion
+// gets its "new purchases" balance created the first time you charge something to it.
+const cardSibling = inst => S.debts.find(x=>x.type==='revolving' && x.lender==='cc' && ((inst.linkId && x.linkId===inst.linkId) || (!inst.linkId && x.product===inst.product && x.product!=='revolving' && x.product!=='installment')));
+const cardOnlyInstallments = () => S.debts.filter(d=>d.lender==='cc' && d.type==='addon' && !cardSibling(d));
 const cardDebts = () => S.debts.filter(d=>d.type==='revolving' || (d.type==='schedule' && d.lender!=='person'));
+function virtualCard(inst){ return { id:'card:'+inst.id, lender:'cc', product:inst.product, nickname:inst.nickname||'', type:'revolving', rate:3, balance:0, payment:0, limit:0, plan:'balance', linkId:inst.linkId||'virtual', dueDay:inst.dueDay||0 }; }
+const normTarget = v => { if ((v||'').startsWith('card:')){ const inst=S.debts.find(x=>x.id===v.slice(5)); const sib=inst&&cardSibling(inst); if (sib) return 'debt:'+sib.id; } return v||''; };
 function payOptions(sel, none='Not tracked'){
-  const cards=cardDebts();
-  return acctOptions(sel, none) + (cards.length?`<optgroup label="Charge to a card / pay later">${cards.map(d=>{ const f=debtFacts(d); const lim=num(d.limit); return `<option value="debt:${d.id}" ${sel==='debt:'+d.id?'selected':''}>${esc(debtName(d))} · ${lim?peso(Math.max(0,lim-f.remaining))+' available':peso(f.remaining)+' owed'}</option>`; }).join('')}</optgroup>`:'');
+  sel = normTarget(sel);
+  const cards=cardDebts(), extra=cardOnlyInstallments();
+  const cardOpt = d => { const f=debtFacts(d); const lim=num(d.limit); return `<option value="debt:${d.id}" ${sel==='debt:'+d.id?'selected':''}>${esc(debtName(d))} · ${lim?peso(Math.max(0,lim-f.remaining))+' available':peso(f.remaining)+' owed'}</option>`; };
+  const instOpt = d => { const name=debtName(virtualCard(d)).replace(/ · Balance$/,''); return `<option value="card:${d.id}" ${sel==='card:'+d.id?'selected':''}>${esc(name)} · new purchase</option>`; };
+  return acctOptions(sel, none) + ((cards.length||extra.length)?`<optgroup label="Charge to a card / pay later">${cards.map(cardOpt).join('')}${extra.map(instOpt).join('')}</optgroup>`:'');
 }
-const canPay = () => accts().length || cardDebts().length;
-const parseTarget = v => (v||'').startsWith('debt:') ? {charge:v.slice(5)} : (v?{acct:v}:{});
+const canPay = () => accts().length || cardDebts().length || cardOnlyInstallments().length;
+// Turns a "Paid from" choice into where the money came from. Creates a card's purchases balance on first use.
+function parseTarget(v){
+  v = normTarget(v);
+  if (v.startsWith('card:')){ const inst=S.debts.find(x=>x.id===v.slice(5)); if (!inst) return {};
+    const link = inst.linkId || uid(); inst.linkId = link;
+    const sib = { ...virtualCard(inst), id:uid(), linkId:link, startBalance:0, paidTotal:0, createdAt:today() };
+    S.debts.push(sib); CHG=null; return {charge:sib.id}; }
+  return v.startsWith('debt:') ? {charge:v.slice(5)} : (v?{acct:v}:{});
+}
+const targetDebt = v => { v=normTarget(v||''); if (v.startsWith('debt:')) return S.debts.find(x=>x.id===v.slice(5)); if (v.startsWith('card:')){ const inst=S.debts.find(x=>x.id===v.slice(5)); return inst?virtualCard(inst):null; } return null; };
 const targetOf = e => e.charge ? 'debt:'+e.charge : (e.acct||'');
 const targetName = e => e.charge ? (S.debts.find(d=>d.id===e.charge) ? 'charged to '+debtName(S.debts.find(d=>d.id===e.charge)) : '') : acctName(e.acct);
 // Service / convenience fee for paying with a credit card: a fixed ₱ amount or a % of the payment.
@@ -1337,7 +1355,7 @@ function wireCharge(sel, box, amtEl, init){
   let svcMode='amt';
   const setMode=mo=>{ svcMode=mo==='pct'?'pct':'amt'; box.querySelectorAll('[data-co-mode] [data-m]').forEach(b=>b.setAttribute('aria-pressed', b.dataset.m===svcMode)); g('[data-co-pre]').hidden=svcMode==='pct'; g('[data-co-suf]').hidden=svcMode!=='pct'; const i=g('[data-co-svcval]'); i.style.paddingLeft = svcMode==='pct'?'12px':''; };
   box.querySelectorAll('[data-co-mode] [data-m]').forEach(b=>b.onclick=()=>{ setMode(b.dataset.m); upd(); });
-  const upd=()=>{ const v=sel.value||''; const d=v.startsWith('debt:')?S.debts.find(x=>x.id===v.slice(5)):null; box.hidden=!d; if(!d) return;
+  const upd=()=>{ const d=targetDebt(sel.value); box.hidden=!d; if(!d) return;
     const sched=d.type==='schedule'; g('[data-co-grid]').hidden=!sched; g('[data-co-svc]').hidden=sched;
     if (!sched){
       if (box.dataset.for!==d.id){ box.dataset.for=d.id; const src = init && init.svcMode ? {mode:init.svcMode, val:init.svcVal} : (d.lastSvc||{mode:'amt',val:''}); setMode(src.mode); g('[data-co-svcval]').value = src.val ?? ''; init=null; }
@@ -1349,7 +1367,7 @@ function wireCharge(sel, box, amtEl, init){
     const tot=num(amtEl.value)+num(g('[data-co-fee]').value), n=+g('[data-co-n]').value||1, st=g('[data-co-start]').value||shiftMonth(monthKey(),1);
     g('[data-co-prev]').textContent = tot>0 ? `${n===1?'':n+' × '}${peso(tot/n,2)} ${n===1?'due':'a month starting'} ${monthLabel(st,true)} — added to your ${debtName(d)} schedule.` : ''; };
   sel.addEventListener('change',upd); amtEl.addEventListener('input',upd); box.addEventListener('input',upd); box.addEventListener('change',upd); upd();
-  return { get(){ return sel.value.startsWith('debt:') ? { n:+g('[data-co-n]').value||1, start:g('[data-co-start]').value||shiftMonth(monthKey(),1), fee:num(g('[data-co-fee]').value), svcMode, svcVal:g('[data-co-svcval]').value } : null; } };
+  return { get(){ return /^(debt|card):/.test(sel.value) ? { n:+g('[data-co-n]').value||1, start:g('[data-co-start]').value||shiftMonth(monthKey(),1), fee:num(g('[data-co-fee]').value), svcMode, svcVal:g('[data-co-svcval]').value } : null; } };
 }
 let QCO = null;
 
@@ -1854,7 +1872,7 @@ function expenseModal(id){
     </form>`, m=>{
     const eco = wireCharge(m.querySelector('#eAcct'), m.querySelector('#eCharge .charge-opts'), m.querySelector('#eAmt'), ex&&ex.chargeOpts);
     m.querySelector('#expForm').onsubmit=e=>{ e.preventDefault(); const amt=num($('#eAmt').value); if(amt<=0) return toast('Enter an amount above zero.');
-      const rec={ id: ex?ex.id:uid(), amount:amt, date:$('#eDate').value||today(), cat:$('#eCat').value, note:$('#eNote').value.trim(), ...parseTarget($('#eAcct').value), ...(ex&&ex.billId?{billId:ex.billId,part:ex.part||0}:{}), ...(ex&&ex.oneoffId?{oneoffId:ex.oneoffId}:{}), ...(ex&&ex.charge&&ex.billed&&ex.charge===parseTarget($('#eAcct').value).charge?{billed:true}:{}), ...(ex&&ex.debtId?{debtId:ex.debtId}:{}) };
+      let eTgt={}; const rec={ id: ex?ex.id:uid(), amount:amt, date:$('#eDate').value||today(), cat:$('#eCat').value, note:$('#eNote').value.trim(), ...(eTgt=parseTarget($('#eAcct').value)), ...(ex&&ex.billId?{billId:ex.billId,part:ex.part||0}:{}), ...(ex&&ex.oneoffId?{oneoffId:ex.oneoffId}:{}), ...(ex&&ex.charge&&ex.billed&&ex.charge===eTgt.charge?{billed:true}:{}), ...(ex&&ex.debtId?{debtId:ex.debtId}:{}) };
       if (commitCheck()) return;
       const names=[]; let paidBefore=0; if(ex){ paidBefore=detachCharge(ex,false); S.expenses[key]=S.expenses[key].filter(x=>x.id!==ex.id); names.push('exp-'+key); }
       const nk=rec.date.slice(0,7); (S.expenses[nk]=S.expenses[nk]||[]).push(rec); names.push('exp-'+nk);
