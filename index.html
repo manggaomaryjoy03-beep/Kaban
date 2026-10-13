@@ -959,7 +959,7 @@ function recModal(id){
       ${r?'':`<div class="grid-form">
         <label class="field">How much did you lend?<div class="input-wrap"><span class="prefix">₱</span><input class="input num" id="rAmt" inputmode="decimal" placeholder="0"></div></label>
         <label class="field">Date lent<input class="input" type="date" id="rDate" value="${today()}"></label>
-        ${accts().length?`<label class="field">Taken from<select class="input" id="rFrom">${acctOptions('', 'Don\'t deduct (lent before)')}</select></label>`:''}
+        ${canPay()?`<label class="field">Taken from<select class="input" id="rFrom">${payOptions('', 'Don\'t deduct (lent before)')}</select></label>`:''}
       </div>
       <label class="field">Already paid back so far <span class="hint">optional, for older pautang</span><div class="input-wrap"><span class="prefix">₱</span><input class="input num" id="rPaid" inputmode="decimal" placeholder="0"></div></label>`}
       <div><div class="eyebrow" style="margin-bottom:8px">When will they pay you back?</div><div id="rSched"></div>
@@ -979,7 +979,7 @@ function recModal(id){
       if (commitCheck()) return;
       const rec={ id:r?r.id:'r-'+uid(), name, note:q('#rNote').value.trim(), day:+q('#rDay').value||0, schedule:sc, date:r?r.date:(q('#rDate').value||today()), lent:r?r.lent:num(q('#rAmt').value)||schedFacts(sc).total };
       if (!r){ const pre=num(q('#rPaid')?.value); if (pre>0) applyToSched(rec.schedule, pre);
-        const from=q('#rFrom')?.value; if (from && rec.lent>0){ S.transfers=(S.transfers||[]).concat([{id:uid(),date:rec.date,from,to:'',amount:rec.lent,note:'Pautang · '+name,recId:rec.id}]); } }
+        const from=q('#rFrom')?.value||''; if (from && rec.lent>0){ const ft=parseTarget(from); if (ft.charge) chargeDirect(S.debts.find(x=>x.id===ft.charge), rec.lent, rec.date, {n:1, start:shiftMonth(monthKey(),1)}); else S.transfers=(S.transfers||[]).concat([{id:uid(),date:rec.date,from:ft.acct,to:'',amount:rec.lent,note:'Pautang · '+name,recId:rec.id}]); } }
       S.receivables = recList().slice(); const ix=S.receivables.findIndex(x=>x.id===rec.id); if (ix>=0) S.receivables[ix]=rec; else S.receivables.push(rec);
       closeModal(); commit(); toast(r?'Pautang updated':`Pautang to ${name} added — ${peso(schedFacts(rec.schedule).remaining)} to collect`); };
   });
@@ -1288,9 +1288,10 @@ const cardOnlyInstallments = () => S.debts.filter(d=>d.lender==='cc' && d.type==
 const cardDebts = () => S.debts.filter(d=>d.type==='revolving' || (d.type==='schedule' && d.lender!=='person'));
 function virtualCard(inst){ return { id:'card:'+inst.id, lender:'cc', product:inst.product, nickname:inst.nickname||'', type:'revolving', rate:3, balance:0, payment:0, limit:0, plan:'balance', linkId:inst.linkId||'virtual', dueDay:inst.dueDay||0 }; }
 const normTarget = v => { if ((v||'').startsWith('card:')){ const inst=S.debts.find(x=>x.id===v.slice(5)); const sib=inst&&cardSibling(inst); if (sib) return 'debt:'+sib.id; } return v||''; };
-function payOptions(sel, none='Not tracked'){
+function payOptions(sel, none='Not tracked', skip){
   sel = normTarget(sel);
-  const cards=cardDebts(), extra=cardOnlyInstallments();
+  const sk = d => skip && skip(d);
+  const cards=cardDebts().filter(d=>!sk(d)), extra=cardOnlyInstallments().filter(d=>!sk(d));
   const cardOpt = d => { const f=debtFacts(d); const lim=num(d.limit); return `<option value="debt:${d.id}" ${sel==='debt:'+d.id?'selected':''}>${esc(debtName(d))} · ${lim?peso(Math.max(0,lim-f.remaining))+' available':peso(f.remaining)+' owed'}</option>`; };
   const instOpt = d => { const name=debtName(virtualCard(d)).replace(/ · Balance$/,''); return `<option value="card:${d.id}" ${sel==='card:'+d.id?'selected':''}>${esc(name)} · new purchase</option>`; };
   return acctOptions(sel, none) + ((cards.length||extra.length)?`<optgroup label="Charge to a card / pay later">${cards.map(cardOpt).join('')}${extra.map(instOpt).join('')}</optgroup>`:'');
@@ -1304,6 +1305,11 @@ function parseTarget(v){
     const sib = { ...virtualCard(inst), id:uid(), linkId:link, startBalance:0, paidTotal:0, createdAt:today() };
     S.debts.push(sib); CHG=null; return {charge:sib.id}; }
   return v.startsWith('debt:') ? {charge:v.slice(5)} : (v?{acct:v}:{});
+}
+function chargeDirect(card, amt, date, opts){
+  if (!card || !(amt>0)) return; CHG=null;
+  if (card.type==='schedule') attachCharge({id:'x'+uid(), amount:amt, date, charge:card.id}, opts||{});
+  else { card.balance = Math.round((num(card.balance)+amt)*100)/100; card.startBalance = Math.max(num(card.startBalance), num(card.balance)); }
 }
 const targetDebt = v => { v=normTarget(v||''); if (v.startsWith('debt:')) return S.debts.find(x=>x.id===v.slice(5)); if (v.startsWith('card:')){ const inst=S.debts.find(x=>x.id===v.slice(5)); return inst?virtualCard(inst):null; } return null; };
 const targetOf = e => e.charge ? 'debt:'+e.charge : (e.acct||'');
@@ -2177,18 +2183,30 @@ function payDebtModal(id, prefill){
     <div class="grid-form"><label class="field">Amount paid<div class="input-wrap"><span class="prefix">₱</span><input class="input num" id="pAmt" inputmode="decimal" value="${def.toFixed(2)}"></div></label>
     <label class="field">Date<input class="input" type="date" id="pDate" value="${today()}"></label></div>
     ${d.type==='schedule'?`<span class="hint">Goes to the oldest unpaid month first${f.next?' ('+monthLabel(f.next.month,true)+')':''}. Paying less leaves the rest of that month open.</span>`:d.type==='addon'?`<span class="hint" id="pHint">Counts as one monthly amortization. A bigger amount counts as several months (each ${peso(f.pmt,2)}).</span>`:`<span class="hint">Kaban subtracts this from the balance. Update the balance from your next statement to include new interest or purchases.</span>`}
-    ${accts().length?`<label class="field">Paid from<select class="input" id="pAcct">${acctOptions(defaultAcct())}</select></label>`:''}
-    <label class="row" style="padding:0;cursor:pointer"><input type="checkbox" id="pExp" checked style="width:18px;height:18px;accent-color:var(--pine)"><span class="small">Also record it in this month's expenses as a debt payment</span></label>
+    ${canPay()?`<label class="field">Paid from<select class="input" id="pAcct">${payOptions(defaultAcct(), 'Not tracked', x=>x.id===d.id || (d.linkId && x.linkId===d.linkId))}</select></label>
+    <div id="pCharge">${chargeBox()}</div>`:''}
+    <label class="row" id="pExpRow" style="padding:0;cursor:pointer"><input type="checkbox" id="pExp" checked style="width:18px;height:18px;accent-color:var(--pine)"><span class="small">Also record it in this month's expenses as a debt payment</span></label>
     ${chargeCredit(d)>0?`<span class="hint">${peso(chargeCredit(d))} of this card's balance is purchases you already logged as expenses. That part of your payment won't be counted as spending again.</span>`:''}
     <div class="modal-foot"><button type="button" class="btn" data-act="close">Cancel</button><button class="btn primary">${ico('check')}Log payment</button></div></form>`, m=>{
+    const pco = wireCharge(m.querySelector('#pAcct'), m.querySelector('#pCharge .charge-opts'), m.querySelector('#pAmt'));
+    const pexp=()=>{ const r=m.querySelector('#pExpRow'); if(r) r.hidden = /^(debt|card):/.test(m.querySelector('#pAcct')?.value||''); }; m.querySelector('#pAcct')?.addEventListener('change', pexp); pexp();
     m.querySelector('#pForm').onsubmit=e=>{ e.preventDefault(); if (commitCheck()) return; const amt=num($('#pAmt').value); if(amt<=0) return toast('Enter the amount you paid.');
+      const co = pco.get(); const ptgt = parseTarget($('#pAcct')?$('#pAcct').value:''); const card = ptgt.charge ? S.debts.find(x=>x.id===ptgt.charge) : null;
       if (d.type==='schedule'){ const over=applyToSched(d.schedule, amt); if (over>0.5) toast(`That's ${peso(over)} more than you owe — the extra wasn't applied.`); }
       else if (d.type==='addon') d.paidMonths=Math.min(d.term,(d.paidMonths||0)+Math.max(1,Math.floor((amt+0.01)/f.pmt))); else { const eff=debtFacts(d).remaining; d.balance=Math.max(0, eff-amt); markBilled(d.id); d.paidTotal=(d.paidTotal||0)+amt; }
       const credit=chargeCredit(d), covered=Math.min(amt, credit); if (covered>0) d.chargeRepaid=num(d.chargeRepaid)+covered;
-      const names=['debts']; const pa=$('#pAcct')?$('#pAcct').value:''; { const pk=($('#pDate').value||today()).slice(0,7); d.monthPaid={...(d.monthPaid||{}), [pk]: num((d.monthPaid||{})[pk]) + amt}; }
+      const names=['debts']; const pa=ptgt.acct||''; { const pk=($('#pDate').value||today()).slice(0,7); d.monthPaid={...(d.monthPaid||{}), [pk]: num((d.monthPaid||{})[pk]) + amt}; }
       { const pk2=($('#pDate').value||today()).slice(0,7); if (covered>0) d.monthCovered={...(d.monthCovered||{}), [pk2]: num((d.monthCovered||{})[pk2])+covered}; if (covered>0 && pa) S.transfers=(S.transfers||[]).concat([{id:uid(),date:$('#pDate').value||today(),from:pa,to:'',amount:covered,note:'Card payment · '+debtName(d)}]); }
       const amtX = amt - covered;
-      if (amtX<=0.005){ /* fully covered by purchases already counted as spending */ }
+      if (card){ const date=$('#pDate').value||today(), k=date.slice(0,7);
+        const fee = card.type==='schedule' ? 0 : svcFeeOf(amt, co?.svcMode, co?.svcVal);
+        if (co && card.type!=='schedule' && co.svcVal!=='' && co.svcVal!=null) card.lastSvc={mode:co.svcMode||'amt', val:co.svcVal};
+        if (covered>0) chargeDirect(card, covered, date, co);
+        let prec=null; if (amtX>0.005){ prec={id:uid(),amount:Math.round(amtX*100)/100,date,cat:'debtpay',note:debtName(d),debtId:d.id,charge:card.id}; (S.expenses[k]=S.expenses[k]||[]).push(prec); attachCharge(prec, {...(co||{}), svcVal:''}); }
+        if (fee>0) (S.expenses[k]=S.expenses[k]||[]).push({id:uid(),amount:fee,date,cat:'fees',note:`Card service fee · ${debtName(d)}${co?.svcMode==='pct'?` (${num(co.svcVal)}%)`:''}`,charge:card.id,feeOf:prec?prec.id:d.id});
+        setTimeout(()=>toast(`Paid with ${debtName(card)}${fee>0?` + ${peso(fee,2)} fee`:''}. That card's balance went up.`), 1800);
+      }
+      else if (amtX<=0.005){ /* fully covered by purchases already counted as spending */ }
       else if ($('#pExp').checked){ const amt=amtX; const date=$('#pDate').value||today(), k=date.slice(0,7); (S.expenses[k]=S.expenses[k]||[]).push({id:uid(),amount:amt,date,cat:'debtpay',note:debtName(d),debtId:d.id,...(pa?{acct:pa}:{})}); names.push('exp-'+k); }
       else if (pa){ S.transfers=(S.transfers||[]).concat([{id:uid(),date:$('#pDate').value||today(),from:pa,to:'',amount:amtX,note:'Payment · '+debtName(d)}]); }
       if (covered>0) setTimeout(()=>toast(`${peso(covered)} of this pays for purchases you already logged, so it isn't counted as spending twice.`), 1800);
