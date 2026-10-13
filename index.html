@@ -1139,7 +1139,7 @@ function payBillModal(billId, part){
     q('#bpForm').onsubmit=e=>{ e.preventDefault(); const amt=num(q('#bpAmt').value); if (amt<=0) return toast('Enter the amount you paid.'); if (commitCheck()) return;
       const date=q('#bpDate').value||today(), k=date.slice(0,7), tgt=parseTarget(q('#bpAcct')?.value||''), acct=tgt.acct||'';
       const brec={id:uid(),amount:amt,date,cat:b.cat,note:label,billId:b.id,part:part||0,...tgt}; (S.expenses[k]=S.expenses[k]||[]).push(brec); if (tgt.charge) attachCharge(brec, bco.get());
-      closeModal(); commit(); toast(`${label} paid · ${peso(amt,amt%1?2:0)}${acct?' from '+acctName(acct):tgt.charge?' · '+targetName(brec):''}`); };
+      closeModal(); commit(); toast(`${label} paid · ${peso(amt,amt%1?2:0)}${acct?' from '+acctName(acct):tgt.charge?' · '+targetName(brec)+(brec.svcFee?` + ${peso(brec.svcFee,2)} fee`:''):''}`); };
   });
 }
 
@@ -1192,7 +1192,7 @@ function payOneoffModal(id){
     m.querySelector('#poForm').onsubmit=e=>{ e.preventDefault(); const amt=num(m.querySelector('#poAmt').value); if(amt<=0) return toast('Enter the amount you paid.'); if (commitCheck()) return;
       const date=m.querySelector('#poDate').value||today(), k=date.slice(0,7), tgt=parseTarget(m.querySelector('#poAcct')?.value||'');
       const orec={id:uid(),amount:amt,date,cat:o.cat||'other',note:o.name,oneoffId:o.id,...tgt}; (S.expenses[k]=S.expenses[k]||[]).push(orec); if (tgt.charge) attachCharge(orec, oco.get());
-      closeModal(); commit(); toast(`${o.name} paid · ${peso(amt,amt%1?2:0)}`); };
+      closeModal(); commit(); toast(`${o.name} paid · ${peso(amt,amt%1?2:0)}${orec.svcFee?` + ${peso(orec.svcFee,2)} card fee`:''}`); };
   });
 }
 
@@ -1290,16 +1290,27 @@ const canPay = () => accts().length || cardDebts().length;
 const parseTarget = v => (v||'').startsWith('debt:') ? {charge:v.slice(5)} : (v?{acct:v}:{});
 const targetOf = e => e.charge ? 'debt:'+e.charge : (e.acct||'');
 const targetName = e => e.charge ? (S.debts.find(d=>d.id===e.charge) ? 'charged to '+debtName(S.debts.find(d=>d.id===e.charge)) : '') : acctName(e.acct);
+// Service / convenience fee for paying with a credit card: a fixed ₱ amount or a % of the payment.
+const svcFeeOf = (amt, mode, val) => Math.round((mode==='pct' ? num(amt)*num(val)/100 : num(val))*100)/100;
 function attachCharge(e, opts, paidBefore=0){
-  const d=S.debts.find(x=>x.id===e.charge); CHG=null; if(!d||d.type!=='schedule') return;
+  const d=S.debts.find(x=>x.id===e.charge); CHG=null; if(!d) return;
+  if (d.type!=='schedule'){
+    const fee=svcFeeOf(e.amount, opts?.svcMode, opts?.svcVal);
+    e.chargeOpts={svcMode:opts?.svcMode||'amt', svcVal:opts?.svcVal||''};
+    if (opts && opts.svcVal!==undefined && opts.svcVal!=='') d.lastSvc={mode:opts.svcMode||'amt', val:opts.svcVal};
+    if (fee>0){ const k=e.date.slice(0,7); (S.expenses[k]=S.expenses[k]||[]).push({id:uid(), amount:fee, date:e.date, cat:'fees', note:`Card service fee · ${e.note||catById(e.cat).name}${opts.svcMode==='pct'?` (${num(opts.svcVal)}%)`:''}`, charge:d.id, feeOf:e.id}); e.svcFee=fee; }
+    return;
+  }
   const n=Math.max(1,+(opts?.n)||1), start=opts?.start||shiftMonth(monthKey(),1), fee=num(opts?.fee), total=num(e.amount)+fee, per=Math.round(total/n*100)/100;
   const rows=[]; for(let i=0;i<n;i++) rows.push({id:uid(), month:shiftMonth(start,i), amount: i===n-1 ? Math.round((total-per*(n-1))*100)/100 : per, paid:0, fromExp:e.id});
   if (paidBefore>0) applyToSched(rows, paidBefore);
   d.schedule=(d.schedule||[]).concat(rows).sort((a,b)=>a.month.localeCompare(b.month)); e.chargeOpts={n,start,fee};
 }
-// Removes a charge's installments. keepPaid: leave already-paid parts as closed rows (for deletes).
+// Removes a charge's card fee and installments. keepPaid: leave already-paid parts as closed rows (for deletes).
 function detachCharge(e, keepPaid){
-  CHG=null; if(!e||!e.charge) return 0; const d=S.debts.find(x=>x.id===e.charge); if(!d||d.type!=='schedule') return 0;
+  CHG=null; if(!e) return 0;
+  for (const k in S.expenses) if (S.expenses[k].some(x=>x.feeOf===e.id && x.cat==='fees' && x.charge)) S.expenses[k]=S.expenses[k].filter(x=>!(x.feeOf===e.id && x.cat==='fees' && x.charge));
+  if(!e.charge) return 0; const d=S.debts.find(x=>x.id===e.charge); if(!d||d.type!=='schedule') return 0;
   const mine=(d.schedule||[]).filter(r=>r.fromExp===e.id), paid=mine.reduce((s,r)=>s+num(r.paid),0);
   d.schedule=(d.schedule||[]).filter(r=>r.fromExp!==e.id);
   if (keepPaid) mine.filter(r=>num(r.paid)>0).forEach(r=>d.schedule.push({...r, amount:num(r.paid), fromExp:undefined}));
@@ -1307,6 +1318,13 @@ function detachCharge(e, keepPaid){
 }
 function chargeBox(){ return `<div class="charge-opts" hidden style="padding:12px;border-radius:12px;background:var(--accent-soft);border:1px solid color-mix(in srgb,var(--accent) 35%,transparent);display:flex;flex-direction:column;gap:8px">
   <strong class="small" data-co-title></strong>
+  <div data-co-svc style="display:flex;flex-direction:column;gap:6px">
+    <span style="font-size:.82rem;font-weight:600;color:var(--ink-2)">Service / convenience fee?</span>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <div class="seg" data-co-mode><button type="button" data-m="amt" aria-pressed="true">₱ Amount</button><button type="button" data-m="pct" aria-pressed="false">% of payment</button></div>
+      <div class="input-wrap" style="width:130px"><span class="prefix" data-co-pre>₱</span><input class="input num" data-co-svcval inputmode="decimal" placeholder="0"><span class="suffix" data-co-suf hidden>%</span></div>
+    </div>
+  </div>
   <div class="grid-form" data-co-grid>
     <label class="field">Payments<select class="input" data-co-n>${[1,2,3,4,6,9,12,18,24].map(n=>`<option value="${n}">${n===1?'1 (pay in full)':n+' months'}</option>`).join('')}</select></label>
     <label class="field">First payment<input class="input" type="month" data-co-start></label>
@@ -1316,17 +1334,22 @@ function chargeBox(){ return `<div class="charge-opts" hidden style="padding:12p
 function wireCharge(sel, box, amtEl, init){
   if (!sel||!box||!amtEl) return { get(){ return null; } };
   const g=x=>box.querySelector(x);
+  let svcMode='amt';
+  const setMode=mo=>{ svcMode=mo==='pct'?'pct':'amt'; box.querySelectorAll('[data-co-mode] [data-m]').forEach(b=>b.setAttribute('aria-pressed', b.dataset.m===svcMode)); g('[data-co-pre]').hidden=svcMode==='pct'; g('[data-co-suf]').hidden=svcMode!=='pct'; const i=g('[data-co-svcval]'); i.style.paddingLeft = svcMode==='pct'?'12px':''; };
+  box.querySelectorAll('[data-co-mode] [data-m]').forEach(b=>b.onclick=()=>{ setMode(b.dataset.m); upd(); });
   const upd=()=>{ const v=sel.value||''; const d=v.startsWith('debt:')?S.debts.find(x=>x.id===v.slice(5)):null; box.hidden=!d; if(!d) return;
-    const sched=d.type==='schedule'; g('[data-co-grid]').hidden=!sched;
-    if (!sched){ const f=debtFacts(d), after=f.remaining+num(amtEl.value), lim=num(d.limit);
-      g('[data-co-title]').textContent=`Added to your ${debtName(d)} balance — no money leaves your accounts today.`;
-      g('[data-co-prev]').textContent=`Balance after: ${peso(after)}${lim?` · ${after>lim?'over your limit by '+peso(after-lim):peso(lim-after)+' still available'}`:''} · interest ≈ ${peso(after*num(d.rate)/100)}/mo if unpaid.`; return; }
+    const sched=d.type==='schedule'; g('[data-co-grid]').hidden=!sched; g('[data-co-svc]').hidden=sched;
+    if (!sched){
+      if (box.dataset.for!==d.id){ box.dataset.for=d.id; const src = init && init.svcMode ? {mode:init.svcMode, val:init.svcVal} : (d.lastSvc||{mode:'amt',val:''}); setMode(src.mode); g('[data-co-svcval]').value = src.val ?? ''; init=null; }
+      const amt=num(amtEl.value), fee=svcFeeOf(amt, svcMode, g('[data-co-svcval]').value), f=debtFacts(d), after=f.remaining+amt+fee, lim=num(d.limit);
+      g('[data-co-title]').textContent=`Charged to your ${debtName(d)} — no money leaves your accounts today.`;
+      g('[data-co-prev]').innerHTML = `${fee>0?`Fee: <strong>${peso(fee,2)}</strong>${svcMode==='pct'?` (${num(g('[data-co-svcval]').value)}% of ${peso(amt,2)})`:''} · total charged <strong>${peso(amt+fee,2)}</strong><br>`:''}Balance after: ${peso(after)}${lim?` · ${after>lim?'over your limit by '+peso(after-lim):peso(lim-after)+' still available'}`:''} · interest ≈ ${peso(after*num(d.rate)/100)}/mo if unpaid.`; return; }
     g('[data-co-title]').textContent=`How will ${debtName(d)} bill this?`;
     if (box.dataset.for!==d.id){ box.dataset.for=d.id; g('[data-co-n]').value = String(init?.n || (d.lender==='atome'?3:1)); g('[data-co-start]').value = init?.start || shiftMonth(monthKey(),1); g('[data-co-fee]').value = init?.fee || ''; init=null; }
     const tot=num(amtEl.value)+num(g('[data-co-fee]').value), n=+g('[data-co-n]').value||1, st=g('[data-co-start]').value||shiftMonth(monthKey(),1);
     g('[data-co-prev]').textContent = tot>0 ? `${n===1?'':n+' × '}${peso(tot/n,2)} ${n===1?'due':'a month starting'} ${monthLabel(st,true)} — added to your ${debtName(d)} schedule.` : ''; };
   sel.addEventListener('change',upd); amtEl.addEventListener('input',upd); box.addEventListener('input',upd); box.addEventListener('change',upd); upd();
-  return { get(){ return sel.value.startsWith('debt:') ? { n:+g('[data-co-n]').value||1, start:g('[data-co-start]').value||shiftMonth(monthKey(),1), fee:num(g('[data-co-fee]').value) } : null; } };
+  return { get(){ return sel.value.startsWith('debt:') ? { n:+g('[data-co-n]').value||1, start:g('[data-co-start]').value||shiftMonth(monthKey(),1), fee:num(g('[data-co-fee]').value), svcMode, svcVal:g('[data-co-svcval]').value } : null; } };
 }
 let QCO = null;
 
@@ -2234,7 +2257,7 @@ document.addEventListener('submit', e=>{
   const date=$('#qDate').value||today(), k=date.slice(0,7);
   const tv=$('#qAcct')?$('#qAcct').value:'', tgt=parseTarget(tv), acct=tgt.acct||''; const qrec={id:uid(),amount:amt,date,cat:EXP_CAT,note:$('#qNote').value.trim(),...tgt}; (S.expenses[k]=S.expenses[k]||[]).push(qrec); if(tgt.charge) attachCharge(qrec, QCO&&QCO.get()); if(acct) S.profile.defaultAcct=acct;
   commit('exp-'+k); { const bc=budgetCheck(), b=num((S.profile.budgets||{})[EXP_CAT]), sp=spentBy(monthKey())[EXP_CAT]||0;
-    toast(`${peso(amt,amt%1?2:0)} added to ${catById(EXP_CAT).name}${acct?' · from '+acctName(acct):tgt.charge?' · '+targetName(qrec):''}` + (bc.safe<0 ? ` — heads up: you're ${peso(-bc.safe)} over for this month.` : b && sp>b ? ` — ${catById(EXP_CAT).name} is now ${peso(sp-b)} over budget.` : '')); }
+    toast(`${peso(amt,amt%1?2:0)} added to ${catById(EXP_CAT).name}${acct?' · from '+acctName(acct):tgt.charge?' · '+targetName(qrec)+(qrec.svcFee?` + ${peso(qrec.svcFee,2)} fee`:''):''}` + (bc.safe<0 ? ` — heads up: you're ${peso(-bc.safe)} over for this month.` : b && sp>b ? ` — ${catById(EXP_CAT).name} is now ${peso(sp-b)} over budget.` : '')); }
   setTimeout(()=>$('#qAmount')&&$('#qAmount').focus(),0);
 });
 document.addEventListener('click', e=>{ const c=e.target.closest('#qCats [data-cat]'); if(!c) return; EXP_CAT=c.dataset.cat; document.querySelectorAll('#qCats [data-cat]').forEach(x=>x.setAttribute('aria-pressed', x===c)); });
