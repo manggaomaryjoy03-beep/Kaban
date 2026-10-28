@@ -1310,6 +1310,7 @@ function monthPanel(){
           ${bc.ready!=null?`<div><span>Free cash now</span><strong class="${bc.freeNow<0?'neg':'pos'}">${peso(bc.freeNow)}</strong></div>`:''}
         </div>
         ${bc.ready!=null&&bc.freeNow<0?`<span class="small neg">Your accounts hold ${peso(bc.ready)}, ${peso(-bc.freeNow)} short of what's still due. Wait for payday before spending on extras.</span>`:''}
+        <button type="button" class="btn sm" data-act="afford" style="align-self:flex-start">${ico('bulb')}Unexpected expense? Plan it</button>
         ${bc.overCats.length?`<div class="small"><strong>Over budget:</strong> ${bc.overCats.map(o=>`${esc(catById(o.c).name)} <span class="neg">+${peso(o.over)}</span>`).join(' · ')}</div>`:''}
         ${S.profile.income.length?`<div class="small" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center"><strong>Paydays:</strong> ${incomeStatus().flatMap(st=>st.parts.map(p=>`<button class="chip ${p.logged?'good':'neutral'}" style="border:0;cursor:pointer" ${p.logged?`data-act="edit-extra" data-id="${p.entries[p.entries.length-1].id}"`:`data-act="log-pay" data-id="${st.src.id}" data-part="${p.i}"`} title="${esc(st.src.name)}">${p.logged?ico('check','style="width:11px;height:11px"'):''}${p.day?ordinal(p.day):esc(st.src.name)} · ${peso(p.logged?p.received:p.expected)}${p.logged?'':' expected'}</button>`)).join('')}</div>`:''}
         ${incomeStatus().some(x=>x.received===0)&&S.profile.income.length?`<span class="faint small">Income uses your expected pay until you log what you actually received. <a href="#" data-nav="budget" style="color:var(--pine)">Log pay</a></span>`:''}
@@ -1422,6 +1423,134 @@ function wireCharge(sel, box, amtEl, init){
   return { get(){ return /^(debt|card):/.test(sel.value) ? { n:+g('[data-co-n]').value||1, start:g('[data-co-start]').value||shiftMonth(monthKey(),1), fee:num(g('[data-co-fee]').value), svcMode, svcVal:g('[data-co-svcval]').value } : null; } };
 }
 let QCO = null;
+
+
+/* ---------- "Can I afford this?" — planning an unexpected expense ---------- */
+const URGENCY = { now:'Right now', month:'This month', wait:'It can wait' };
+function affordSources(amount, urgency){
+  const mk=monthKey(), nm=shiftMonth(mk,1), bc=budgetCheck(mk), sp=spentBy(mk), bud=S.profile.budgets||{}, today_=new Date().getDate();
+  const src=[];
+  // money this month that no bill, debt or budget is waiting for
+  const unplanned = Math.max(0, bc.safe - bc.catRoom);
+  // spending budgets you haven't used yet, wants first
+  const wantRooms = Object.keys(bud).filter(c=>!isNeed(c) && c!=='savings' && c!=='debtpay').map(c=>({c, room:Math.max(0,num(bud[c])-(sp[c]||0))})).filter(x=>x.room>=50).sort((a,b)=>b.room-a.room);
+  const wantRoom = wantRooms.reduce((s,x)=>s+x.room,0);
+  // cash in hand right now (accounts minus what's still due this month)
+  const cashNow = bc.freeNow==null ? null : Math.max(0, bc.freeNow);
+  // paydays still coming this month
+  const paysLeft = incomeStatus(mk).flatMap(st=>st.parts.filter(p=>!p.logged && (!p.day || p.day>=today_)).map(p=>({name:st.src.name, day:p.day, amt:p.expected})));
+  const savings = accts().filter(a=>a.type==='savings' && acctBalance(a)>0).map(a=>({a, bal:acctBalance(a)}));
+  const savingsTotal = savings.reduce((s,x)=>s+x.bal,0);
+  const pautang = recList().map(r=>{ const f=schedFacts(r.schedule); const due=f.unpaid.filter(e=>e.month<=mk).reduce((s,e)=>s+e.left,0); return {r, due}; }).filter(x=>x.due>0);
+  const pautangDue = pautang.reduce((s,x)=>s+x.due,0);
+  const extra = num(S.profile.extra);
+  const cards = S.debts.filter(d=>d.type==='revolving' && d.lender==='cc').map(d=>{ const f=debtFacts(d), lim=num(d.limit); return {d, avail: lim?Math.max(0,lim-f.remaining):null, rate:num(d.rate)||3}; }).filter(x=>x.avail==null || x.avail>=amount*0.5);
+  const payLater = S.debts.filter(d=>d.type==='schedule' && (d.lender==='atome'||d.lender==='spaylater'));
+  // a normal month's leftover after bills, debts and budgets
+  const T=debtTotals(), plan=currentPlan();
+  const nextSurplus = incomeTotalExpected() - billsDueTotal(nm) - (plan.pays[1] ?? T.monthly) - budgetTotal();
+  return { mk, nm, bc, unplanned, wantRooms, wantRoom, cashNow, paysLeft, savings, savingsTotal, pautang, pautangDue, extra, cards, payLater, nextSurplus };
+}
+function affordSavePlan(amount, surplus){
+  if (amount<=0) return null;
+  const bud=S.profile.budgets||{}; const wants=Object.keys(bud).filter(c=>!isNeed(c) && c!=='savings' && c!=='debtpay').reduce((s,c)=>s+num(bud[c]),0);
+  const base=Math.max(0,surplus)*0.6; let trim=0;
+  if (base<=0 || amount/base>6) trim=Math.floor(wants*0.3/50)*50;   // free up part of the wants budgets each month
+  const cap=base+trim; if (cap<50) return { none:true };
+  const months=Math.max(1, Math.ceil(amount/cap)); const per=Math.ceil(amount/months/50)*50;
+  return { months, per, trim:Math.min(trim, per), long: months>24 };
+}
+function affordPlan(amount, urgency){
+  // Order: money that costs nothing → money that slows you down a little → (never automatically) new debt.
+  const x = affordSources(amount, urgency); let need = amount; const steps=[];
+  let cashCap = urgency==='now' ? (x.cashNow==null ? Infinity : x.cashNow) : Infinity;
+  const take=(v, cash)=>{ let t=Math.max(0,Math.min(need, v)); if (cash && cashCap!==Infinity) t=Math.min(t, cashCap); if (cash && cashCap!==Infinity) cashCap-=t; need-=t; return t; };
+  const now = urgency==='now'; let t;
+  if ((t=take(x.unplanned, now))>0) steps.push({ key:'unplanned', amt:t, cost:0, title:'Use money that isn\'t planned for anything', detail:`After your bills, debts and budgets, about ${peso(x.unplanned)} is still free this month.` });
+  if (need>0 && x.wantRoom>0){ let left=now&&cashCap!==Infinity?Math.min(need,cashCap):need; const cuts=[]; for (const w of x.wantRooms){ if(left<=0) break; const c=Math.ceil(Math.min(w.room,left)); cuts.push({c:w.c, amt:c}); left-=c; }
+    const tt=take(cuts.reduce((s,c)=>s+c.amt,0), now); if (tt>0) steps.push({ key:'cut', amt:tt, cost:0, title:'Spend less on wants this month', detail:'Skip or reduce: '+cuts.map(c=>`${catById(c.c).name} −${peso(c.amt)}`).join(', ')+'.', cuts }); }
+  if (!now && need>0 && x.pautangDue>0 && (t=take(x.pautangDue))>0) steps.push({ key:'pautang', amt:t, cost:0, title:'Collect pautang that\'s due', detail:x.pautang.map(p=>`${p.r.name} owes ${peso(p.due)}`).join(' · ')+'. Only spend it once they\'ve actually paid.' });
+  if (urgency==='wait' && need>0){ const sp=affordSavePlan(need, x.nextSurplus); if (sp && !sp.none && !sp.long){ const tt=take(need);
+    steps.push({ key:'save', amt:tt, cost:0, months:sp.months, per:sp.per, title:`Save ${peso(sp.per)} a month for ${sp.months} month${sp.months===1?'':'s'}`, detail:(sp.trim?`Lower your wants budgets by ${peso(sp.trim)} a month to make room. `:`A normal month leaves you about ${peso(x.nextSurplus)} after bills, debts and budgets, so ${peso(sp.per)} still leaves a cushion. `)+`You can buy it in ${monthLabel(shiftMonth(x.mk,sp.months),true)} without borrowing.`, trim:sp.trim }); } }
+  if (need>0 && x.extra>0){ const amt=Math.min(x.extra, need); const im=lumpImpact(amt); const tt=take(amt, now); const cost=im&&!im.stuck?im.saved:0;
+    if (tt>0) steps.push({ key:'extra', amt:tt, cost, slow:true, title:'Pause your extra debt payment this month', detail:`You planned ${peso(x.extra)} extra toward debts. Using it here adds no new debt, but costs about ${peso(cost)} more interest over time${im&&im.sooner?` and delays debt-free by about ${im.sooner} month${im.sooner===1?'':'s'}`:''}.` }); }
+  if (need>0 && x.savingsTotal>0){ const tt=take(x.savingsTotal, false); const back=Math.ceil(tt/3/50)*50;
+    if (tt>0) steps.push({ key:'savings', amt:tt, cost:0, slow:true, title:'Borrow from your own savings', detail:`From ${x.savings.map(s=>`${s.a.name} (${peso(s.bal)})`).join(', ')}. Put it back at about ${peso(back)} a month for 3 months.` }); }
+  const short=Math.max(0,need);
+  // What waiting would look like (shown whenever it can't be covered without debt)
+  const waitPlan = short>0 ? affordSavePlan(amount - steps.filter(s=>s.key==='unplanned'||s.key==='cut').reduce((s,x)=>s+x.amt,0), x.nextSurplus) : null;
+  // New-debt options: never part of the plan, only listed as a last resort
+  const debtOpts=[];
+  const base = short>0 ? short : amount;
+  x.payLater.forEach(d=>{ const per=Math.ceil(base/3); debtOpts.push({ title:`Split with ${debtName(d)}`, detail:`≈ ${peso(per)} a month for 3 months, plus any fees the app adds. This adds ${peso(base)} to your debts.` }); });
+  x.cards.slice().sort((a,b)=>a.rate-b.rate).slice(0,2).forEach(c=>{ const int=Math.round(base*c.rate/100); debtOpts.push({ title:`Charge to ${debtName(c.d)}`, detail:`Only free if you pay the whole statement by the due date. Otherwise ≈ ${peso(int)} interest every month at ${c.rate}%.` }); });
+  const free = steps.filter(s=>!s.slow).reduce((s,x)=>s+x.amt,0);
+  const verdict = short>0 ? 'short' : free>=amount-0.5 ? (steps.length===1 && steps[0].key==='unplanned' ? 'easy' : steps.some(s=>s.key==='save') ? 'save' : 'adjust') : 'stretch';
+  return { x, steps, short, verdict, waitPlan, debtOpts };
+}
+function affordModal(){
+  openModal(`${mhead('Can I afford this?')}
+    <p class="muted small" style="margin:0">Enter something you didn't plan for. Kaban checks your budget, accounts, paydays, debts and savings and finds a way to cover it <strong>without taking on new debt</strong>.</p>
+    <form id="afForm" style="display:flex;flex-direction:column;gap:14px" autocomplete="off">
+      <div class="grid-form">
+        <label class="field">What is it?<input class="input" id="afName" placeholder="e.g. Baby's checkup, phone repair"></label>
+        <label class="field">How much?<div class="input-wrap"><span class="prefix">₱</span><input class="input num" id="afAmt" inputmode="decimal" placeholder="0"></div></label>
+        <label class="field">Category<select class="input" id="afCat">${allCats().filter(c=>c.id!=='debtpay').map(c=>`<option value="${c.id}" ${c.id==='other'?'selected':''}>${esc(c.name)}</option>`).join('')}</select></label>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px"><span style="font-size:.82rem;font-weight:600;color:var(--ink-2)">How soon?</span>
+        <div class="seg" id="afUrg">${Object.entries(URGENCY).map(([k,v])=>`<button type="button" data-u="${k}" aria-pressed="${k==='month'}">${v}</button>`).join('')}</div></div>
+      <div id="afOut"></div>
+    </form>`, m=>{
+    const q=s=>m.querySelector(s); let urg='month';
+    const draw=()=>{ const amt=num(q('#afAmt').value); const out=q('#afOut'); if (amt<=0){ out.innerHTML=''; return; }
+      const p=affordPlan(amt, urg), name=q('#afName').value.trim()||'This';
+      const V={ easy:['good','Yes — no new debt needed',`${esc(name)} fits in this month's leftover money. Nothing else has to change.`],
+                adjust:['good','Yes — with small changes, no new debt','Follow the plan below and you won\'t need to borrow.'],
+                save:['good','Yes — if you save up for it first','No borrowing: set the money aside each month, then buy it.'],
+                stretch:['warn','Yes, without new debt — but it slows you down','You\'d dip into savings or your extra debt money. Waiting a little is the stronger choice if you can.'],
+                short:['bad','Not without borrowing',`You're ${peso(p.short)} short using only your own money. To avoid new debt, wait and save for it.`] }[p.verdict];
+      out.innerHTML = `
+        <div style="border-radius:14px;padding:14px 16px;background:var(--${V[0]}-soft);border:1px solid color-mix(in srgb,var(--${V[0]}) 30%,transparent)">
+          <div class="eyebrow" style="color:var(--${V[0]})">${V[1]}</div>
+          <div style="font-family:var(--f-display);font-weight:800;font-size:1.3rem;margin:2px 0;color:var(--${V[0]})" class="num">${peso(amt)}${p.short>0?` · ${peso(p.short)} short`:''}</div>
+          <p class="small" style="margin:0;color:var(--ink-2)">${V[2]}</p></div>
+        ${p.verdict==='short' ? `<div style="border-radius:14px;padding:12px 14px;border:1px dashed var(--line-2,var(--line))">
+            <div class="title" style="font-weight:700">Better: wait and save</div>
+            <div class="meta small" style="margin-top:2px;white-space:normal">${p.waitPlan && !p.waitPlan.none ? `Set aside <strong>${peso(p.waitPlan.per)}</strong> a month${p.waitPlan.trim?` (lower your wants budgets by ${peso(p.waitPlan.trim)} a month to make room)`:''} and you can pay for it in <strong>${monthLabel(shiftMonth(monthKey(),p.waitPlan.months),true)}</strong> — no interest, no new debt.${p.waitPlan.long?` That's over 2 years, so a cheaper option may be worth looking for.`:''}` : `Right now a normal month has no room left after bills, debts and budgets, so there's nothing to save from yet. Lower a budget on the Budget page, then check again.`}</div>
+            ${p.waitPlan && !p.waitPlan.none ? `<button type="button" class="btn sm primary" data-act="af-save" style="margin-top:8px">Start saving for it</button>`:''}</div>` : ''}
+        ${p.steps.length?`<div style="display:flex;flex-direction:column;gap:2px"><span class="eyebrow" style="margin:6px 0">${p.verdict==='short'?`If it truly can't wait — your own money covers ${peso(amt-p.short)}`:'Suggested plan'}</span>
+          <div class="list">${p.steps.map((st,i)=>`<div class="row" style="align-items:flex-start">
+            <div class="cat-ico" style="background:${st.slow?'var(--warn-soft)':'var(--good-soft)'};color:${st.slow?'var(--warn)':'var(--good)'};font-size:.85rem">${i+1}</div>
+            <div class="grow"><div class="title" style="white-space:normal">${esc(st.title)}</div><div class="meta" style="white-space:normal">${esc(st.detail)}</div>${st.cost>0?`<span class="chip warn" style="margin-top:4px">no new debt · ≈ ${peso(st.cost)} more interest</span>`:st.slow?`<span class="chip warn" style="margin-top:4px">no new debt · pay yourself back</span>`:`<span class="chip good" style="margin-top:4px">no new debt · no cost</span>`}</div>
+            <span class="amount">${peso(st.amt)}</span></div>`).join('')}</div></div>`:''}
+        ${p.debtOpts.length && p.short>0 ? `<details><summary class="small" style="cursor:pointer;color:var(--bad)">Last resort only — options that add debt</summary>
+            <p class="small muted" style="margin:6px 0">Use these only for a true emergency (health, safety, income). Each one makes your debt bigger.</p>
+            <div class="list">${p.debtOpts.map(o=>`<div class="row"><div class="cat-ico" style="background:var(--bad-soft);color:var(--bad)">!</div><div class="grow"><div class="title" style="white-space:normal">${esc(o.title)}</div><div class="meta" style="white-space:normal">${esc(o.detail)}</div></div></div>`).join('')}</div></details>` : ''}
+        ${affordFacts(p.x)}
+        <div class="modal-foot" style="justify-content:flex-start">
+          ${urg==='wait' && p.steps.some(s=>s.key==='save') ? `<button type="button" class="btn primary" data-act="af-save">Start saving for it</button>` : ''}
+          ${p.verdict==='short'?'':`<button type="button" class="btn ${urg==='wait'?'':'primary'}" data-act="af-plan" data-month="${urg==='wait'?shiftMonth(monthKey(),Math.max(1,(p.steps.find(s=>s.key==='save')||{}).months||1)):monthKey()}">Add to ${urg==='wait'?'checklist when ready':'this month\'s checklist'}</button>`}
+          ${urg==='now'&&p.verdict!=='short'?`<button type="button" class="btn" data-act="af-log">I paid it — log expense</button>`:''}
+        </div>`;
+      out.dataset.amt=amt; out.dataset.name=name; out.dataset.cat=q('#afCat').value;
+      const sv=p.steps.find(s=>s.key==='save') || (p.verdict==='short' && p.waitPlan && !p.waitPlan.none ? p.waitPlan : null); out.dataset.per=sv?sv.per:''; out.dataset.months=sv?sv.months:''; out.dataset.trim=sv&&sv.trim?sv.trim:'';
+    };
+    ['#afAmt','#afName'].forEach(s=>q(s).addEventListener('input',draw)); q('#afCat').addEventListener('change',draw);
+    m.querySelectorAll('#afUrg [data-u]').forEach(b=>b.onclick=()=>{ urg=b.dataset.u; m.querySelectorAll('#afUrg [data-u]').forEach(x=>x.setAttribute('aria-pressed',x===b)); draw(); });
+    q('#afForm').onsubmit=e=>e.preventDefault();
+    setTimeout(()=>q('#afName').focus(),30);
+  });
+}
+function affordFacts(x){
+  const bits=[];
+  bits.push(`<div><span>Free this month</span><strong>${peso(x.unplanned)}</strong></div>`);
+  bits.push(`<div><span>Unused wants budget</span><strong>${peso(x.wantRoom)}</strong></div>`);
+  if (x.cashNow!=null) bits.push(`<div><span>Cash free right now</span><strong>${peso(x.cashNow)}</strong></div>`);
+  if (x.paysLeft.length) bits.push(`<div><span>Next payday</span><strong>${x.paysLeft[0].day?ordinal(x.paysLeft[0].day):'this month'} · ${peso(x.paysLeft[0].amt)}</strong></div>`);
+  if (x.savingsTotal) bits.push(`<div><span>Savings</span><strong>${peso(x.savingsTotal)}</strong></div>`);
+  bits.push(`<div><span>Normal month leftover</span><strong class="${x.nextSurplus<0?'neg':''}">${peso(x.nextSurplus)}</strong></div>`);
+  return `<details style="margin-top:4px"><summary class="small faint" style="cursor:pointer">What Kaban looked at</summary><div class="calc" style="margin-top:8px">${bits.join('')}</div></details>`;
+}
 
 /* ---------- toast & confetti ---------- */
 let toastT;
@@ -1559,7 +1688,7 @@ function vOverview(){
     : `At your current plan you'll be <b>debt-free by ${freeDate}</b> — ${plan.months} month${plan.months===1?'':'s'} from now.`;
   return `
   <div class="topbar"><div><div class="eyebrow">${monthLabel(mk,true)}</div><h1>${greeting()}, ${esc(S.profile.name||'ka-Kaban')}</h1><div class="sub muted">Here's where your money stands today.</div></div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn gold" data-act="add-expense">${ico('plus')}Add expense</button><button class="btn" data-act="add-extra">${ico('coin')}Add extra money</button><button class="btn" data-act="add-debt">${ico('card')}Add debt</button></div></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn gold" data-act="add-expense">${ico('plus')}Add expense</button><button class="btn" data-act="afford">${ico('bulb')}Can I afford this?</button><button class="btn" data-act="add-extra">${ico('coin')}Add extra money</button><button class="btn" data-act="add-debt">${ico('card')}Add debt</button></div></div>
   <div class="panels">
     <section class="hero">
       <div class="hero-ring"><svg viewBox="0 0 132 132"><circle cx="66" cy="66" r="${r}" fill="none" stroke="rgba(255,255,255,.16)" stroke-width="12"/><circle cx="66" cy="66" r="${r}" fill="none" stroke="#F0B24F" stroke-width="12" stroke-linecap="round" stroke-dasharray="${C*progress} ${C}"/></svg><div class="pct num">${Math.round(progress*100)}%<small>paid off</small></div></div>
@@ -1700,7 +1829,7 @@ function vBudget(){
   const rule = (label, val, target, color) => { const p=inc?val/inc*100:0; return `<div style="display:flex;flex-direction:column;gap:6px"><div style="display:flex;justify-content:space-between;gap:8px"><strong>${label}</strong><span class="num">${pct(p,0)} <span class="faint">/ ${target}%</span></span></div><div class="bar ${p>target+5&&label!=='Debt & savings'?'over':''}"><i style="width:${Math.min(100,p)}%;background:${color}"></i></div><span class="faint small num">${peso(val)} of ${peso(inc*target/100)} guide</span></div>`; };
   const budgetCats = BASE_CATS.filter(c=>!['housing','bills','load','debtpay'].includes(c.id) || num(bud[c.id])>0);
   return `
-  <div class="topbar"><div><div class="eyebrow">Monthly plan</div><h1>Budget</h1><div class="sub muted">Give every peso a job before the month starts.</div></div></div>
+  <div class="topbar"><div><div class="eyebrow">Monthly plan</div><h1>Budget</h1><div class="sub muted">Give every peso a job before the month starts.</div></div><button class="btn" data-act="afford">${ico('bulb')}Can I afford this?</button></div>
   <div class="panels">
     <div class="panel span-3 kpi"><span class="eyebrow">Income</span><span class="val num">${peso(inc)}</span><span class="foot">expected${receivedIncome(mk)?` · ${peso(receivedIncome(mk))} received`:''}</span></div>
     <div class="panel span-3 kpi"><span class="eyebrow">Fixed bills</span><span class="val num">${peso(bills)}</span>${S.profile.bills.some(b=>billEvery(b)>1)?`<span class="foot">a month, incl. set-aside for quarterly/yearly bills</span>`:''}</div>
@@ -1910,16 +2039,16 @@ document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeModal(); });
 document.addEventListener('mousedown', e=>{ if(e.target.matches('[data-scrim]')) closeModal(); });
 const mhead = t => `<div class="modal-head"><h2>${t}</h2><button class="icon-btn" data-act="close" aria-label="Close">${ico('x')}</button></div>`;
 
-function expenseModal(id){
+function expenseModal(id, pre){
   let ex=null, key=null; if(id){ for(const k in S.expenses){ const f=S.expenses[k].find(e=>e.id===id); if(f){ex=f;key=k;break;} } }
   openModal(`${mhead(ex?((ex.billId||ex.oneoffId)?'Payment':'Edit expense'):'Add expense')}
     <form id="expForm" style="display:flex;flex-direction:column;gap:14px">
-      <div class="grid-form"><label class="field">Amount<div class="input-wrap"><span class="prefix">₱</span><input class="input num" id="eAmt" inputmode="decimal" required value="${ex?ex.amount:''}"></div></label>
+      <div class="grid-form"><label class="field">Amount<div class="input-wrap"><span class="prefix">₱</span><input class="input num" id="eAmt" inputmode="decimal" required value="${ex?ex.amount:(pre?.amount||'')}"></div></label>
       <label class="field">Date<input class="input" type="date" id="eDate" value="${ex?ex.date:today()}"></label></div>
       <label class="field">Paid from<select class="input" id="eAcct">${payOptions(ex?targetOf(ex):defaultAcct())}</select></label>
       <div id="eCharge">${chargeBox()}</div>
-      <label class="field">Category<select class="input" id="eCat">${allCats().map(c=>`<option value="${c.id}" ${(ex?ex.cat:EXP_CAT)===c.id?'selected':''}>${esc(c.name)}</option>`).join('')}</select></label>
-      <label class="field">Note<input class="input" id="eNote" value="${esc(ex?ex.note:'')}" placeholder="Optional"></label>
+      <label class="field">Category<select class="input" id="eCat">${allCats().map(c=>`<option value="${c.id}" ${(ex?ex.cat:(pre?.cat||EXP_CAT))===c.id?'selected':''}>${esc(c.name)}</option>`).join('')}</select></label>
+      <label class="field">Note<input class="input" id="eNote" value="${esc(ex?ex.note:(pre?.note||''))}" placeholder="Optional"></label>
       <div class="modal-foot">${ex?`<button type="button" class="btn danger ghost" data-act="del-expense" data-id="${ex.id}" style="margin-right:auto">${ico('trash')}${(ex.billId||ex.oneoffId)?'Undo payment':'Delete'}</button>`:''}<button type="button" class="btn" data-act="close">Cancel</button><button class="btn primary" type="submit">Save</button></div>
     </form>`, m=>{
     const eco = wireCharge(m.querySelector('#eAcct'), m.querySelector('#eCharge .charge-opts'), m.querySelector('#eAmt'), ex&&ex.chargeOpts);
@@ -2281,6 +2410,15 @@ document.addEventListener('click', e=>{
       adopt(d); S.updatedAt=Date.now(); MODE = canSync()?'cloud':'local'; closeModal(); saveLocal(); flush(); setSync(); render(); toast('Backup restored'); break; }
     case 'start-fresh': leaveDemo(false); toast('Fresh start. Add your income, bills and debts.'); break;
     case 'add-expense': expenseModal(); break;
+    case 'afford': affordModal(); break;
+    case 'af-log': { const o=$('#afOut'); const pre={amount:o.dataset.amt, cat:o.dataset.cat, note:o.dataset.name==='This'?'':o.dataset.name}; closeModal(); expenseModal(null, pre); break; }
+    case 'af-plan': { if (commitCheck()) return; const o=$('#afOut'); const mk2=b.dataset.month||monthKey(); S.oneoffs=S.oneoffs||{}; (S.oneoffs[mk2]=(S.oneoffs[mk2]||[]).slice()).push({ id:'o-'+uid(), name:o.dataset.name==='This'?'Unexpected expense':o.dataset.name, amount:num(o.dataset.amt), day:0, cat:o.dataset.cat||'other', payFrom:'' }); closeModal(); commit(); toast(`Added to your ${monthLabel(mk2,true)} checklist`); break; }
+    case 'af-save': { if (commitCheck()) return; const o=$('#afOut'); const nm=(o.dataset.name==='This'?'Unexpected expense':o.dataset.name); const id='u-'+uid();
+      S.profile.customCats=customCats().concat([{ id, name:'Saving for: '+nm, group:'Saving goals', c:7, need:true }]); S.profile.budgets={...(S.profile.budgets||{}), [id]: num(o.dataset.per)};
+      let trim=num(o.dataset.trim); const trimmed=[]; if (trim>0){ const bb=S.profile.budgets; const ws=Object.keys(bb).filter(c=>c!==id && !isNeed(c) && c!=='savings' && c!=='debtpay' && num(bb[c])>0); const tot=ws.reduce((s,c)=>s+num(bb[c]),0);
+        ws.forEach(c=>{ const cut=Math.min(num(bb[c]), Math.round(trim*num(bb[c])/tot/50)*50); if(cut>0){ bb[c]=num(bb[c])-cut; trimmed.push(catById(c).name+' −'+peso(cut)); } }); }
+      const mk2=shiftMonth(monthKey(), +o.dataset.months||1); S.oneoffs=S.oneoffs||{}; (S.oneoffs[mk2]=(S.oneoffs[mk2]||[]).slice()).push({ id:'o-'+uid(), name:nm, amount:num(o.dataset.amt), day:0, cat:o.dataset.cat||'other', payFrom:'' });
+      closeModal(); commit(); toast(`Saving ${peso(num(o.dataset.per))}/month for ${nm} — added to your budget${trimmed.length?` (lowered ${trimmed.join(', ')})`:''} and to your ${monthLabel(mk2,true)} checklist`); break; }
     case 'edit-expense': expenseModal(id); break;
     case 'del-expense': { if (commitCheck()) return; { const ex0=allExpenses().find(x=>x.id===id); if (ex0) detachCharge(ex0,true); } for(const k in S.expenses){ const n=S.expenses[k].length; S.expenses[k]=S.expenses[k].filter(x=>x.id!==id); if(S.expenses[k].length!==n){ closeModal(); commit('exp-'+k); toast('Expense deleted'); break; } } break; }
     case 'exp-month': EXP_MONTH=shiftMonth(EXP_MONTH,+b.dataset.k); render(); break;

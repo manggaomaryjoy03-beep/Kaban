@@ -1,5 +1,5 @@
 /* Kaban offline app shell. Bump VERSION whenever index.html changes so phones pick up the update. */
-const VERSION = 'kaban-20261028-090255';
+const VERSION = 'kaban-20261028-134913';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './maskable-512.png', './apple-touch-icon.png', './favicon-32.png'];
 
 self.addEventListener('install', e => {
