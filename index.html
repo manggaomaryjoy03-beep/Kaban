@@ -505,7 +505,7 @@ function simulate(items, extra=0, strategy='avalanche', rollover=true){
 /* ---------- state & storage ---------- */
 const LS_KEY = 'kaban.v1';
 const emptyProfile = () => ({ name:'Mary Joy', extra:0, strategy:'avalanche', income:[], bills:[], budgets:{}, customCats:[], accounts:[], defaultAcct:'', startedAt: today() });
-let S = { profile: emptyProfile(), debts: [], expenses: {}, extras: {}, transfers: [], receivables: [], oneoffs: {} };
+let S = { profile: emptyProfile(), debts: [], expenses: {}, extras: {}, transfers: [], receivables: [], oneoffs: {}, skips: {} };
 let MODE = 'loading'; // 'demo' | 'cloud' | 'local'
 let VIEW = 'overview', EXP_MONTH = monthKey(), EXP_CAT = 'food', DEBT_FILTER='active';
 
@@ -586,14 +586,14 @@ function commit(){
   saveLocal(); flush(); render();
 }
 function leaveDemo(fromEdit){
-  S = { profile: emptyProfile(), debts: [], expenses: {}, extras: {}, transfers: [], receivables: [], oneoffs: {}, updatedAt: Date.now() };
+  S = { profile: emptyProfile(), debts: [], expenses: {}, extras: {}, transfers: [], receivables: [], oneoffs: {}, skips: {}, updatedAt: Date.now() };
   MODE = canSync() ? 'cloud' : 'local';
   saveLocal(); flush(); setSync(); render();
   if (fromEdit) toast('Example data cleared. Add that entry again — this tracker is now yours.');
 }
 function adopt(data){
   if (!data || !data.profile) return false;
-  S = { profile:{...emptyProfile(), ...data.profile}, debts: data.debts||[], expenses: data.expenses||{}, extras: data.extras||{}, transfers: data.transfers||[], receivables: data.receivables||[], oneoffs: data.oneoffs||{}, updatedAt: data.updatedAt||0 };
+  S = { profile:{...emptyProfile(), ...data.profile}, debts: data.debts||[], expenses: data.expenses||{}, extras: data.extras||{}, transfers: data.transfers||[], receivables: data.receivables||[], oneoffs: data.oneoffs||{}, skips: data.skips||{}, updatedAt: data.updatedAt||0 };
   return true;
 }
 
@@ -1102,12 +1102,14 @@ function monthChecklist(key=monthKey()){
     if (expected<=0 && paid<=0) return;
     items.push({ kind:'debt', id:d.id, name:debtName(d), day:+d.dueDay||0, expected, paid, done: paid>=expected-1 || f.done });
   });
+  items.forEach(x=>{ x.key=skipKey(x.kind,x.id,x.part); if (!x.done && isSkipped(x.key,key)) x.skipped=true; });
+  const skipped=items.filter(x=>x.skipped); for (let i=items.length-1;i>=0;i--) if (items[i].skipped) items.splice(i,1);
   items.sort((a,b)=>(a.done-b.done) || ((a.day||99)-(b.day||99)));
   const spendItems=items.filter(x=>x.kind!=='move'), moves=items.filter(x=>x.kind==='move');
   const toPay=spendItems.filter(x=>!x.done).reduce((s,x)=>s+Math.max(0,x.expected-x.paid),0);
   const paid=spendItems.reduce((s,x)=>s+x.paid,0), planned=spendItems.reduce((s,x)=>s+(x.done?x.paid:Math.max(x.expected,x.paid)),0);
   const toMove=moves.filter(x=>!x.done).reduce((s,x)=>s+x.expected,0);
-  return { items, toPay, paid, planned, toMove };
+  return { items, toPay, paid, planned, toMove, skipped };
 }
 function budgetCheck(key=monthKey()){
   const cl=monthChecklist(key), income=effectiveIncome(key)+extraTotal(key), spent=monthSpent(key);
@@ -1234,6 +1236,50 @@ function moveModal(b, part, tr){
 }
 function editMoveModal(id){ const tr=(S.transfers||[]).find(t=>t.id===id); if(!tr) return; const b=S.profile.bills.find(x=>x.id===tr.billId); if(!b) return transferModal(tr.from); moveModal(b, tr.part||0, tr); }
 
+
+/* ---------- skipping a checklist item this month (e.g. no money for it yet) ---------- */
+const skipKey = (kind,id,part) => `${kind}:${id}:${part||0}`;
+const isSkipped = (k, mk=monthKey()) => ((S.skips||{})[mk]||[]).some(x=>x.key===k);
+function skipModal(kind, id, part){
+  const mk=monthKey(), cl=monthChecklist(mk), it=cl.items.find(x=>x.key===skipKey(kind,id,part)); if(!it) return;
+  const left=Math.max(0,it.expected-it.paid), nextMk=shiftMonth(mk,1), canCarry = kind==='bill' || kind==='oneoff';
+  openModal(`${mhead('Can\'t pay this month?')}
+    <div class="row" style="padding:0"><div class="cat-ico" style="background:var(--warn-soft);color:var(--warn)">${ico('alert','style="width:18px;height:18px"')}</div><div class="grow"><div class="title">${esc(it.name)}</div><div class="meta">${peso(left)} · ${monthLabel(mk,true)}</div></div></div>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      ${canCarry?`<button type="button" class="btn primary" data-act="do-carry" data-key="${it.key}" style="justify-content:flex-start;align-items:flex-start;text-align:left;white-space:normal;padding:12px 14px">${ico('route','style="width:20px;height:20px;flex:none;margin-top:2px"')}<span><strong>Carry over to ${monthLabel(nextMk,true)}</strong><br><span style="font-weight:500;opacity:.85" class="small">It leaves this month's list and shows up next month as "${esc(it.name)} (unpaid from ${MONTHS[+mk.slice(5)-1]})".</span></span></button>`:''}
+      <button type="button" class="btn" data-act="do-skip" data-key="${it.key}" style="justify-content:flex-start;align-items:flex-start;text-align:left;white-space:normal;padding:12px 14px">${ico('x','style="width:20px;height:20px;flex:none;margin-top:2px"')}<span><strong>Skip this month</strong><br><span style="font-weight:500" class="small muted">${kind==='debt'?'Removes it from this month\'s list and from what you still need to pay. You still owe it — it stays on your Debts page.':'Removes it from this month\'s list and from what you still need to pay. It won\'t come back unless you undo it.'}</span></span></button>
+    </div>
+    ${kind==='debt'?`<span class="hint">Missing a loan or card payment can add late fees and interest. If you can pay part of it, use <strong>Pay</strong> with a smaller amount instead.</span>`:''}
+    <div class="modal-foot"><button type="button" class="btn ghost" data-act="close">Cancel</button></div>`);
+}
+function doSkip(key, carry){
+  if (commitCheck()) return;
+  const mk=monthKey(), cl=monthChecklist(mk), it=cl.items.find(x=>x.key===key); if(!it) return closeModal();
+  S.skips=S.skips||{}; const list=(S.skips[mk]=(S.skips[mk]||[]).filter(x=>x.key!==key));
+  const rec={ key, name:it.name, amount:Math.max(0,it.expected-it.paid), at:today() };
+  if (carry){
+    const nextMk=shiftMonth(mk,1), oid='o-'+uid();
+    let cat='bills', payFrom=it.from||'';
+    if (it.kind==='bill'){ const b=S.profile.bills.find(x=>x.id===it.id); if(b){ cat=b.cat; payFrom=b.payFrom||''; } }
+    if (it.kind==='oneoff'){ const o=((S.oneoffs||{})[mk]||[]).find(x=>x.id===it.id); if(o){ cat=o.cat; payFrom=o.payFrom||''; } }
+    S.oneoffs=S.oneoffs||{}; (S.oneoffs[nextMk]=(S.oneoffs[nextMk]||[]).slice()).push({ id:oid, name:`${it.name.replace(/ \(unpaid from [A-Za-z]+\)$/,'')} (unpaid from ${MONTHS[+mk.slice(5)-1]})`, amount:rec.amount, day:it.day||0, cat, payFrom, carriedFrom:mk });
+    rec.carriedTo={ month:nextMk, id:oid };
+  }
+  list.push(rec);
+  closeModal(); commit(); toast(carry ? `${it.name} moved to ${monthLabel(shiftMonth(mk,1),true)}` : `${it.name} skipped for this month`);
+}
+function undoSkip(key){
+  if (commitCheck()) return;
+  const mk=monthKey(); const list=(S.skips||{})[mk]||[]; const rec=list.find(x=>x.key===key); if(!rec) return;
+  if (rec.carriedTo){ const nm=rec.carriedTo.month; const paid=allExpenses().some(e=>e.oneoffId===rec.carriedTo.id);
+    if (paid) return toast('You already paid the carried-over amount next month, so this can\'t be undone.');
+    S.oneoffs[nm]=(S.oneoffs[nm]||[]).filter(o=>o.id!==rec.carriedTo.id); }
+  S.skips[mk]=list.filter(x=>x.key!==key);
+  commit(); toast(`${rec.name} is back on this month's list`);
+}
+
+function skippedBlock(mk){ const list=(S.skips||{})[mk]||[]; if(!list.length) return '';
+  return `<div class="small" style="margin-top:12px;padding:10px 12px;border-radius:12px;border:1px dashed var(--line);background:var(--surface-2);display:flex;flex-direction:column;gap:6px"><span class="faint">Not paying this month · ${peso(list.reduce((s,x)=>s+num(x.amount),0))}</span>${list.map(x=>`<div style="display:flex;align-items:center;gap:8px"><span style="flex:1;min-width:0;line-height:1.7"><span style="text-decoration:line-through;color:var(--ink-3)">${esc(x.name)}</span> <span class="num faint">${peso(num(x.amount))}</span>${x.carriedTo?` <span class="chip gold">moved to ${MONTHS[+x.carriedTo.month.slice(5)-1]}</span>`:` <span class="chip neutral">skipped</span>`}</span><button class="btn sm ghost" style="flex:none" data-act="unskip" data-key="${esc(x.key)}">Undo</button></div>`).join('')}</div>`; }
 function monthPanel(){
   const bc=budgetCheck(), cl=bc.cl, mk=monthKey();
   const tone = bc.safe<0 ? 'bad' : (bc.overCats.length || bc.safe < bc.catRoom || bc.safe < bc.income*0.05 || (bc.freeNow!=null && bc.freeNow<0)) ? 'warn' : 'good';
@@ -1245,13 +1291,13 @@ function monthPanel(){
       <button type="button" class="cat-ico check-btn ${x.done?'is-done':''}" ${x.kind==='move' ? (x.done?`data-act="edit-move" data-id="${x.trId}" aria-label="Moved — change or undo"`:`data-act="pay-bill" data-id="${x.id}" data-part="${x.part||0}" aria-label="Move ${esc(x.name)}"`) : x.done ? (x.expId?`data-act="edit-expense" data-id="${x.expId}" aria-label="Paid — change amount or undo"`:'disabled aria-label="Paid"') : `data-act="${x.kind==='bill'?'pay-bill':x.kind==='oneoff'?'pay-oneoff':'pay-debt'}" data-id="${x.id}" data-part="${x.part||0}" aria-label="Mark ${esc(x.name)} as paid"`}>${x.done?ico('check','style="width:18px;height:18px"'):`<span class="num">${x.day||'—'}</span>`}</button>
       <div class="grow"><div class="title" style="${x.done?'text-decoration:line-through;text-decoration-color:var(--ink-3);color:var(--ink-2)':''}">${esc(x.name)}</div><div class="meta">${x.kind==='move'?'Transfer'+(x.to&&acctName(x.to)?' to '+esc(acctName(x.to)):'')+' · not spending':x.kind==='debt'?'Debt':x.kind==='oneoff'?'This month only':x.every>1?FREQ_LABEL[x.every]+' bill':'Monthly bill'}${x.day?' · due '+MONTHS[new Date().getMonth()]+' '+x.day:''}${x.kind!=='move'&&x.from?(x.from.startsWith('debt:')?' · on '+esc(debtName(S.debts.find(d=>d.id===x.from.slice(5))||{})):acctName(x.from)?' · from '+esc(acctName(x.from)):''):''}${x.done&&Math.abs(x.paid-x.expected)>=1?` · <span class="${x.paid>x.expected?'neg':'pos'}">${x.paid>x.expected?'+':'−'}${peso(Math.abs(x.paid-x.expected))} vs ${x.kind==='oneoff'?'planned':'usual'}</span>`:''}</div></div>
       <span class="amount ${x.done?'faint':''}">${peso(x.done?x.paid:Math.max(0,x.expected-x.paid))}</span>
-      ${x.kind==='move' ? (x.done?`<button class="btn sm ghost" data-act="edit-move" data-id="${x.trId}">Edit</button>`:`<button class="btn sm" data-act="pay-bill" data-id="${x.id}" data-part="${x.part||0}">Move</button>`) : x.done ? (x.expId?`<button class="btn sm ghost" data-act="edit-expense" data-id="${x.expId}">Edit</button>`:'') : `${x.kind==='oneoff'?`<button class="icon-btn" data-act="edit-oneoff" data-id="${x.id}" aria-label="Edit">${ico('edit')}</button>`:''}<button class="btn sm" data-act="${x.kind==='bill'?'pay-bill':x.kind==='oneoff'?'pay-oneoff':'pay-debt'}" data-id="${x.id}" data-part="${x.part||0}">Pay</button>`}
+      ${x.kind==='move' ? (x.done?`<button class="btn sm ghost" data-act="edit-move" data-id="${x.trId}">Edit</button>`:`<button class="icon-btn" data-act="skip-item" data-kind="move" data-id="${x.id}" data-part="${x.part||0}" aria-label="Skip ${esc(x.name)} this month" title="Skip this month">${ico('x')}</button><button class="btn sm" data-act="pay-bill" data-id="${x.id}" data-part="${x.part||0}">Move</button>`) : x.done ? (x.expId?`<button class="btn sm ghost" data-act="edit-expense" data-id="${x.expId}">Edit</button>`:'') : `${x.kind==='oneoff'?`<button class="icon-btn" data-act="edit-oneoff" data-id="${x.id}" aria-label="Edit">${ico('edit')}</button>`:''}<button class="icon-btn" data-act="skip-item" data-kind="${x.kind}" data-id="${x.id}" data-part="${x.part||0}" aria-label="Can't pay ${esc(x.name)} this month" title="Can't pay this month">${ico('x')}</button><button class="btn sm" data-act="${x.kind==='bill'?'pay-bill':x.kind==='oneoff'?'pay-oneoff':'pay-debt'}" data-id="${x.id}" data-part="${x.part||0}">Pay</button>`}
     </div>`;
   return `<div class="panel span-12" id="this-month"><div class="panel-head"><div><h2>This month's checklist</h2><div class="faint small">${monthLabel(mk,true)} · ${cl.items.filter(x=>x.done).length} of ${cl.items.length} done</div></div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="chip ${cl.toPay>0?'warn':'good'}">${cl.toPay>0?peso(cl.toPay)+' still to pay':'All paid'}</span><button class="btn sm" data-act="add-check">${ico('plus')}Add item</button></div></div>
     <div class="panels" style="gap:20px">
       <div class="span-7" style="min-width:0">${laterNudge(mk)}${cl.items.length?`<div class="list">${cl.items.map(row).join('')}</div>
-        <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;border-top:1px solid var(--line);padding-top:10px;margin-top:4px" class="small num"><span class="faint">Paid <strong class="pos">${peso(cl.paid)}</strong></span><span class="faint">Still to pay <strong style="color:var(--ink)">${peso(cl.toPay)}</strong></span><span class="faint">Month total <strong style="color:var(--ink)">${peso(cl.planned)}</strong></span>${cl.toMove?`<span class="faint">To move <strong style="color:var(--ink)">${peso(cl.toMove)}</strong></span>`:''}</div>`
-        :`<div class="empty">Nothing to pay yet this month.<button class="btn sm primary" data-act="add-check">${ico('plus')}Add a payment</button><span class="small">Bills and debts you add elsewhere show up here too.</span></div>`}</div>
+        <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;border-top:1px solid var(--line);padding-top:10px;margin-top:4px" class="small num"><span class="faint">Paid <strong class="pos">${peso(cl.paid)}</strong></span><span class="faint">Still to pay <strong style="color:var(--ink)">${peso(cl.toPay)}</strong></span><span class="faint">Month total <strong style="color:var(--ink)">${peso(cl.planned)}</strong></span>${cl.toMove?`<span class="faint">To move <strong style="color:var(--ink)">${peso(cl.toMove)}</strong></span>`:''}</div>${skippedBlock(mk)}`
+        :`${skippedBlock(mk)}<div class="empty">Nothing to pay yet this month.<button class="btn sm primary" data-act="add-check">${ico('plus')}Add a payment</button><span class="small">Bills and debts you add elsewhere show up here too.</span></div>`}</div>
       <div class="span-5" style="display:flex;flex-direction:column;gap:12px">
         <div style="border-radius:14px;padding:16px;background:var(--${tone}-soft);border:1px solid color-mix(in srgb,var(--${tone}) 30%,transparent)">
           <div class="eyebrow" style="color:var(--${tone})">${tone==='bad'?'Over budget':tone==='warn'?'Careful':'On track'}</div>
@@ -1473,10 +1519,10 @@ function upcoming(){
   const addMonth=(key,day,name,amt,kind)=>{ const [y,mo]=key.split('-').map(Number); const dt=new Date(y,mo-1, day?Math.min(day,new Date(y,mo,0).getDate()):new Date(y,mo,0).getDate()); const days=Math.round((dt-t0)/864e5); if(days<=45) out.push({d:dt,days,name,amt,kind}); };
   activeDebts().filter(d=>d.type==='schedule').forEach(d=>debtFacts(d).unpaid.slice(0,2).forEach(e=>addMonth(e.month,+d.dueDay,debtName(d),e.left,'debt')));
   recList().forEach(r=>{ const rf=schedFacts(r.schedule); rf.unpaid.slice(0,1).forEach(e=>addMonth(e.month,+r.day,'Singilin: '+r.name,e.left,'collect')); });
-  activeDebts().filter(d=>d.type!=='schedule').forEach(d=>{ const f=debtFacts(d); add(+d.dueDay, debtName(d), d.type==='addon'?f.pmt:(d.payment||f.setPmt), 'debt'); });
+  activeDebts().filter(d=>d.type!=='schedule' && !isSkipped(skipKey('debt',d.id,0))).forEach(d=>{ const f=debtFacts(d); add(+d.dueDay, debtName(d), d.type==='addon'?f.pmt:(d.payment||f.setPmt), 'debt'); });
   incomeStatus().forEach(st=>st.parts.forEach(p=>{ if (p.day && !p.logged) add(p.day, 'Payday: '+st.src.name, p.expected, 'payday'); }));
   S.profile.bills.filter(b=>billEvery(b)>1).forEach(b=>{ const nk=billNextDue(b, billDueIn(b)&&billPartPaid(b,0)?shiftMonth(monthKey(),1):monthKey()); addMonth(nk, +b.day, b.name+' ('+FREQ_LABEL[billEvery(b)].toLowerCase()+')', billAmount(b), 'bill'); });
-  S.profile.bills.filter(b=>billEvery(b)===1).forEach(b=>billParts(b).forEach((p,i)=>{ if(!billPartPaid(b,i)||new Date().getDate()<+p.day) add(+p.day, b.name + (partLabel(b,i)?' · '+partLabel(b,i):''), num(p.amount), 'bill'); }));
+  S.profile.bills.filter(b=>billEvery(b)===1).forEach(b=>billParts(b).forEach((p,i)=>{ if (isSkipped(skipKey(b.transfer?'move':'bill',b.id,i)) && new Date().getDate()<=+p.day) return; if(!billPartPaid(b,i)||new Date().getDate()<+p.day) add(+p.day, b.name + (partLabel(b,i)?' · '+partLabel(b,i):''), num(p.amount), 'bill'); }));
   return out.sort((a,b)=>a.days-b.days).slice(0,7);
 }
 function insights(){
@@ -2269,6 +2315,10 @@ document.addEventListener('click', e=>{
     case 'edit-move': editMoveModal(id); break;
     case 'del-move': { if (commitCheck()) return; S.transfers=(S.transfers||[]).filter(t=>t.id!==id); for (const k in S.expenses) S.expenses[k]=S.expenses[k].filter(e=>e.feeOf!==id); closeModal(); commit(); toast('Transfer undone'); break; }
     case 'add-check': checkItemModal(); break;
+    case 'skip-item': skipModal(b.dataset.kind, id, +(b.dataset.part||0)); break;
+    case 'do-skip': doSkip(b.dataset.key, false); break;
+    case 'do-carry': doSkip(b.dataset.key, true); break;
+    case 'unskip': undoSkip(b.dataset.key); break;
     case 'edit-oneoff': checkItemModal(id); break;
     case 'pay-oneoff': payOneoffModal(id); break;
     case 'del-oneoff': { if (commitCheck()) return; const mk=monthKey(); S.oneoffs[mk]=(S.oneoffs[mk]||[]).filter(x=>x.id!==id); closeModal(); commit(); toast('Removed from this month'); break; }
