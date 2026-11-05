@@ -1220,18 +1220,19 @@ function payBillModal(billId, part, lateMonth){
       <div class="grid-form"><label class="field">Actual amount<div class="input-wrap"><span class="prefix">₱</span><input class="input num" id="bpAmt" inputmode="decimal" value="${num(p.amount)}"></div></label>
       <label class="field">Date paid<input class="input" type="date" id="bpDate" value="${today()}"></label>
       ${canPay()?`<label class="field">Paid from<select class="input" id="bpAcct">${payOptions(b.payFrom && (acctById(b.payFrom)||b.payFrom.startsWith('debt:')) ? b.payFrom : defaultAcct())}</select></label>`:''}</div>
-      <div id="bpCharge">${chargeBox()}</div>
+      <div id="bpCharge">${chargeBox()}</div>${acctSvcBox()}
       <span class="hint" id="bpDiff">${LB?`This is your ${monthLabel(LB.month,true)} bill (was due ${MONTHS[LB.due.getMonth()]} ${LB.due.getDate()}).`:'Change the amount if this month\'s bill is different, like a higher electric bill.'}</span>
       ${lateFeeQ(od)}
       <div class="modal-foot">${LB?`<button type="button" class="btn ghost" data-act="latebill-done" data-id="${b.id}" data-part="${part||0}" data-month="${LB.month}" style="margin-right:auto">I already paid this</button>`:''}<button type="button" class="btn" data-act="close">Cancel</button><button class="btn primary">${ico('check')}Mark paid</button></div>
     </form>`, m=>{
     const q=s=>m.querySelector(s);
     q('#bpAmt').addEventListener('input',()=>{ const d=num(q('#bpAmt').value)-num(p.amount); q('#bpDiff').innerHTML = Math.abs(d)<0.5 ? 'Same as usual.' : d>0 ? `<span class="neg">${peso(d,d%1?2:0)} more than usual</span> — it comes out of what's left this month.` : `<span class="pos">${peso(-d,d%1?2:0)} less than usual</span> — that much stays free.`; });
-    const bco = wireCharge(q('#bpAcct'), q('#bpCharge .charge-opts'), q('#bpAmt')); const lf=wireLateFee(m);
+    const bco = wireCharge(q('#bpAcct'), q('#bpCharge .charge-opts'), q('#bpAmt')); const lf=wireLateFee(m); const asv=wireAcctSvc(m, q('#bpAcct'), q('#bpAmt'), b);
     q('#bpForm').onsubmit=e=>{ e.preventDefault(); const amt=num(q('#bpAmt').value); if (amt<=0) return toast('Enter the amount you paid.'); if (!lf.ok()) return; if (commitCheck()) return;
       const date=q('#bpDate').value||today(), k=date.slice(0,7), tgt=parseTarget(q('#bpAcct')?.value||''), acct=tgt.acct||'';
       const brec={id:uid(),amount:amt,date,cat:b.cat,note:label+(LB?` (${MONTHS[+LB.month.slice(5)-1]}, paid late)`:''),billId:b.id,part:part||0,...(LB?{lateFor:LB.month}:{}),...tgt}; (S.expenses[k]=S.expenses[k]||[]).push(brec); if (tgt.charge) attachCharge(brec, bco.get());
       const fee=lf.get(); logLateFee(fee, tgt, label+(LB?` (${MONTHS[+LB.month.slice(5)-1]})`:''), date, {lateFeeOf:brec.id});
+      const sfee=asv.get(); logAcctSvc(sfee, tgt.acct, label, date, {feeOf:brec.id}, asv.mode()==='pct'?num(asv.val()):0); if (sfee>0) brec.svcFee=Math.round(sfee*100)/100;
       closeModal(); commit(); toast(`${label} paid · ${peso(amt,amt%1?2:0)}${fee>0?` + ${peso(fee,fee%1?2:0)} late fee`:''}${acct?' from '+acctName(acct):tgt.charge?' · '+targetName(brec)+(brec.svcFee?` + ${peso(brec.svcFee,2)} fee`:''):''}`); };
   });
 }
@@ -1278,15 +1279,16 @@ function payOneoffModal(id){
       <div class="grid-form"><label class="field">Actual amount<div class="input-wrap"><span class="prefix">₱</span><input class="input num" id="poAmt" inputmode="decimal" value="${num(o.amount)}"></div></label>
       <label class="field">Date paid<input class="input" type="date" id="poDate" value="${today()}"></label>
       ${canPay()?`<label class="field">Paid from<select class="input" id="poAcct">${payOptions(o.payFrom&&(acctById(o.payFrom)||o.payFrom.startsWith('debt:'))?o.payFrom:defaultAcct())}</select></label>`:''}</div>
-      <div id="poCharge">${chargeBox()}</div>
+      <div id="poCharge">${chargeBox()}</div>${acctSvcBox()}
       ${lateFeeQ(overdueDaysOf(+o.day||0))}
       <div class="modal-foot"><button type="button" class="btn" data-act="close">Cancel</button><button class="btn primary">${ico('check')}Mark paid</button></div>
     </form>`, m=>{
-    const oco = wireCharge(m.querySelector('#poAcct'), m.querySelector('#poCharge .charge-opts'), m.querySelector('#poAmt')); const lf=wireLateFee(m);
+    const oco = wireCharge(m.querySelector('#poAcct'), m.querySelector('#poCharge .charge-opts'), m.querySelector('#poAmt')); const lf=wireLateFee(m); const asv=wireAcctSvc(m, m.querySelector('#poAcct'), m.querySelector('#poAmt'), o);
     m.querySelector('#poForm').onsubmit=e=>{ e.preventDefault(); const amt=num(m.querySelector('#poAmt').value); if(amt<=0) return toast('Enter the amount you paid.'); if (!lf.ok()) return; if (commitCheck()) return;
       const date=m.querySelector('#poDate').value||today(), k=date.slice(0,7), tgt=parseTarget(m.querySelector('#poAcct')?.value||'');
       const orec={id:uid(),amount:amt,date,cat:o.cat||'other',note:o.name,oneoffId:o.id,...tgt}; (S.expenses[k]=S.expenses[k]||[]).push(orec); if (tgt.charge) attachCharge(orec, oco.get());
       const fee=lf.get(); logLateFee(fee, tgt, o.name, date, {lateFeeOf:orec.id});
+      const sfee=asv.get(); logAcctSvc(sfee, tgt.acct, o.name, date, {feeOf:orec.id}, asv.mode()==='pct'?num(asv.val()):0); if (sfee>0) orec.svcFee=Math.round(sfee*100)/100;
       closeModal(); commit(); toast(`${o.name} paid · ${peso(amt,amt%1?2:0)}${fee>0?` + ${peso(fee,fee%1?2:0)} late fee`:''}${orec.svcFee?` + ${peso(orec.svcFee,2)} card fee`:''}`); };
   });
 }
@@ -1482,6 +1484,34 @@ function detachCharge(e, keepPaid){
   if (keepPaid) mine.filter(r=>num(r.paid)>0).forEach(r=>d.schedule.push({...r, amount:num(r.paid), fromExp:undefined}));
   d.schedule.sort((a,b)=>a.month.localeCompare(b.month)); return paid;
 }
+/* ---------- service / convenience fee when paying from an account (GCash, Maya, bank app…) ---------- */
+function acctSvcBox(){ return `<div class="acct-svc" hidden style="display:flex;flex-direction:column;gap:6px;padding:10px 12px;border-radius:12px;background:var(--surface-2);border:1px solid var(--line)">
+  <span style="font-size:.82rem;font-weight:600;color:var(--ink-2)">Service / convenience fee?</span>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <div class="seg" data-as-mode><button type="button" data-m="amt" aria-pressed="true">₱ Amount</button><button type="button" data-m="pct" aria-pressed="false">% of payment</button></div>
+    <div class="input-wrap" style="width:130px"><span class="prefix" data-as-pre>₱</span><input class="input num" data-as-val inputmode="decimal" placeholder="0"><span class="suffix" data-as-suf hidden>%</span></div>
+  </div>
+  <span class="hint" data-as-hint>For example GCash or Maya Bills Pay fees. Leave it blank if there's none.</span></div>`; }
+// remember: object that keeps the last fee used (a bill, a one-off's name, or a debt)
+function wireAcctSvc(m, sel, amtEl, remember){
+  const box=m.querySelector('.acct-svc'); if(!box||!sel) return { get:()=>0, mode:()=>'amt', val:()=>'' };
+  const g=x=>box.querySelector(x); let mode='amt';
+  const setMode=mo=>{ mode=mo==='pct'?'pct':'amt'; box.querySelectorAll('[data-as-mode] [data-m]').forEach(b=>b.setAttribute('aria-pressed', b.dataset.m===mode)); g('[data-as-pre]').hidden=mode==='pct'; g('[data-as-suf]').hidden=mode!=='pct'; g('[data-as-val]').style.paddingLeft = mode==='pct'?'12px':''; upd(); };
+  box.querySelectorAll('[data-as-mode] [data-m]').forEach(b=>b.onclick=()=>setMode(b.dataset.m));
+  const fee=()=> svcFeeOf(num(amtEl.value), mode, g('[data-as-val]').value);
+  const upd=()=>{ const t=parseTarget(sel.value||''); box.hidden=!t.acct; if (box.hidden) return; const f=fee();
+    g('[data-as-hint]').innerHTML = f>0 ? `<strong>${peso(f,2)}</strong> fee from ${esc(acctName(t.acct))} · logged under Fees &amp; charges` : 'For example GCash or Maya Bills Pay fees. Leave it blank if there\'s none.'; };
+  const last = remember && remember.lastAcctSvc; if (last){ g('[data-as-val]').value=last.val; mode=last.mode; }
+  sel.addEventListener('change', upd); amtEl.addEventListener('input', upd); g('[data-as-val]').addEventListener('input', upd); setMode(mode);
+  return { get(){ const t=parseTarget(sel.value||''); if(!t.acct) return 0; const f=fee(); if (remember) remember.lastAcctSvc = g('[data-as-val]').value!=='' ? {mode, val:g('[data-as-val]').value} : null; return f; },
+           mode:()=>mode, val:()=>g('[data-as-val]').value };
+}
+function logAcctSvc(fee, acct, label, date, extra, pct){
+  if (!(fee>0) || !acct) return null; const k=date.slice(0,7);
+  const fx={ id:uid(), amount:Math.round(fee*100)/100, date, cat:'fees', note:`Service fee · ${label} (via ${acctName(acct)})${pct?` · ${pct}%`:''}`, acct, isSvcFee:true, ...(extra||{}) };
+  (S.expenses[k]=S.expenses[k]||[]).push(fx); return fx;
+}
+
 function chargeBox(){ return `<div class="charge-opts" hidden style="padding:12px;border-radius:12px;background:var(--accent-soft);border:1px solid color-mix(in srgb,var(--accent) 35%,transparent);display:flex;flex-direction:column;gap:8px">
   <strong class="small" data-co-title></strong>
   <div data-co-svc style="display:flex;flex-direction:column;gap:6px">
@@ -2461,7 +2491,7 @@ function payDebtModal(id, prefill, late){
       <div class="calc"><div><span>Missed payment</span><strong id="pLtA"></strong></div><div><span>Late charges</span><strong id="pLtC" class="neg"></strong></div><div><span>Total to pay</span><strong id="pLtT"></strong></div></div>`:''}
     ${late?'':d.type==='schedule'?`<span class="hint">Goes to the oldest unpaid month first${f.next?' ('+monthLabel(f.next.month,true)+')':''}. Paying less leaves the rest of that month open.</span>`:d.type==='addon'?`<span class="hint" id="pHint">Counts as one monthly amortization. A bigger amount counts as several months (each ${peso(f.pmt,2)}).</span>`:`<span class="hint">Kaban subtracts this from the balance. Update the balance from your next statement to include new interest or purchases.</span>`}
     ${canPay()?`<label class="field">Paid from<select class="input" id="pAcct">${payOptions(defaultAcct(), 'Not tracked', x=>x.id===d.id || (d.linkId && x.linkId===d.linkId))}</select></label>
-    <div id="pCharge">${chargeBox()}</div>`:''}
+    <div id="pCharge">${chargeBox()}</div>${acctSvcBox()}`:''}
     <label class="row" id="pExpRow" style="padding:0;cursor:pointer"><input type="checkbox" id="pExp" checked style="width:18px;height:18px;accent-color:var(--pine)"><span class="small">Also record it in this month's expenses as a debt payment</span></label>
     ${chargeCredit(d)>0?`<span class="hint">${peso(chargeCredit(d))} of this card's balance is purchases you already logged as expenses. That part of your payment won't be counted as spending again.</span>`:''}
     ${late?'':lateFeeQ(debtPaidIn(d,monthKey())>0?0:overdueDaysOf(+d.dueDay||0))}
@@ -2470,7 +2500,7 @@ function payDebtModal(id, prefill, late){
       ['#pAmt','#pLateFee','#pLateInt'].forEach(sel=>m.querySelector(sel).addEventListener('input',upd)); upd(); }
     const pco = wireCharge(m.querySelector('#pAcct'), m.querySelector('#pCharge .charge-opts'), m.querySelector('#pAmt'));
     const pexp=()=>{ const r=m.querySelector('#pExpRow'); if(r) r.hidden = /^(debt|card):/.test(m.querySelector('#pAcct')?.value||''); }; m.querySelector('#pAcct')?.addEventListener('change', pexp); pexp();
-    const lf=wireLateFee(m);
+    const lf=wireLateFee(m); const asv=wireAcctSvc(m, m.querySelector('#pAcct'), m.querySelector('#pAmt'), d);
     m.querySelector('#pForm').onsubmit=e=>{ e.preventDefault(); const amt=num($('#pAmt').value); if(amt<=0) return toast('Enter the amount you paid.'); if (!lf.ok()) return; if (commitCheck()) return;
       const co = pco.get(); const ptgt = parseTarget($('#pAcct')?$('#pAcct').value:''); const card = ptgt.charge ? S.debts.find(x=>x.id===ptgt.charge) : null;
       if (d.type==='schedule'){ const over=applyToSched(d.schedule, amt); if (over>0.5) toast(`That's ${peso(over)} more than you owe — the extra wasn't applied.`); }
@@ -2491,6 +2521,7 @@ function payDebtModal(id, prefill, late){
       else if (amtX<=0.005){ /* fully covered by purchases already counted as spending */ }
       else if ($('#pExp').checked){ const amt=amtX; const date=$('#pDate').value||today(), k=date.slice(0,7); (S.expenses[k]=S.expenses[k]||[]).push({id:uid(),amount:amt,date,cat:'debtpay',note:debtName(d)+(late?` (${MONTHS[+late.month.slice(5)-1]}, paid late)`:''),debtId:d.id,...lateTag,...(pa?{acct:pa}:{})}); names.push('exp-'+k); }
       else if (pa){ S.transfers=(S.transfers||[]).concat([{id:uid(),date:$('#pDate').value||today(),from:pa,to:'',amount:amtX,note:'Payment · '+debtName(d)}]); }
+      { const sfee=asv.get(); logAcctSvc(sfee, pa, debtName(d), $('#pDate').value||today(), {svcDebt:d.id}, asv.mode()==='pct'?num(asv.val()):0); if (sfee>0) setTimeout(()=>toast(`+ ${peso(sfee,2)} service fee logged under Fees & charges`), 1500); }
       if (lateCharges>0){ const date=$('#pDate').value||today(), k=date.slice(0,7); const fx={id:uid(),amount:Math.round(lateCharges*100)/100,date,cat:'fees',note:late?`Late charges · ${debtName(d)} (${MONTHS[+late.month.slice(5)-1]})`:`Late fee · ${debtName(d)}`,isLateFee:true,...(late?{lateFor:late.month}:{}),lateDebt:d.id};
         if (card){ fx.charge=card.id; (S.expenses[k]=S.expenses[k]||[]).push(fx); attachCharge(fx, {...(co||{}), svcVal:''}); } else { if (pa) fx.acct=pa; (S.expenses[k]=S.expenses[k]||[]).push(fx); } }
       if (late){ const left=lateDebts().find(x=>x.d.id===d.id && x.month===late.month); if (!left || left.missed<1) d.lateDone={...(d.lateDone||{}), [late.month]:true}; }
@@ -2530,7 +2561,7 @@ document.addEventListener('click', e=>{
       const mk2=shiftMonth(monthKey(), +o.dataset.months||1); S.oneoffs=S.oneoffs||{}; (S.oneoffs[mk2]=(S.oneoffs[mk2]||[]).slice()).push({ id:'o-'+uid(), name:nm, amount:num(o.dataset.amt), day:0, cat:o.dataset.cat||'other', payFrom:'' });
       closeModal(); commit(); toast(`Saving ${peso(num(o.dataset.per))}/month for ${nm} — added to your budget${trimmed.length?` (lowered ${trimmed.join(', ')})`:''} and to your ${monthLabel(mk2,true)} checklist`); break; }
     case 'edit-expense': expenseModal(id); break;
-    case 'del-expense': { if (commitCheck()) return; { const ex0=allExpenses().find(x=>x.id===id); if (ex0) detachCharge(ex0,true); } for(const k in S.expenses){ const n=S.expenses[k].length; S.expenses[k]=S.expenses[k].filter(x=>x.id!==id); if(S.expenses[k].length!==n){ closeModal(); commit('exp-'+k); toast('Expense deleted'); break; } } break; }
+    case 'del-expense': { if (commitCheck()) return; { const ex0=allExpenses().find(x=>x.id===id); if (ex0) detachCharge(ex0,true); for (const k in S.expenses) S.expenses[k]=S.expenses[k].filter(x=>!((x.feeOf===id && x.isSvcFee) || x.lateFeeOf===id)); } for(const k in S.expenses){ const n=S.expenses[k].length; S.expenses[k]=S.expenses[k].filter(x=>x.id!==id); if(S.expenses[k].length!==n){ closeModal(); commit('exp-'+k); toast('Expense deleted'); break; } } break; }
     case 'exp-month': EXP_MONTH=shiftMonth(EXP_MONTH,+b.dataset.k); render(); break;
     case 'add-debt': debtModal(); break;
     case 'edit-debt': debtModal(id); break;
