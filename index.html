@@ -481,7 +481,7 @@ function planItems(debts){
   return debts.map(d=>({d, f:debtFacts(d)})).filter(x=>!x.f.done).map(({d,f})=> d.type==='schedule' ? (()=>{
     const arr=[]; f.unpaid.forEach(e=>{ const k=Math.max(0, monthDiff(mk,e.month)); arr[k]=(arr[k]||0)+e.left; });
     return { id:d.id, name:debtName(d), bal:f.outstanding, rate:0, min:0, sched:Array.from({length:arr.length},(_,i)=>arr[i]||0) }; })() : ({
-    id:d.id, name:debtName(d), bal:f.outstanding, rate:f.monthlyRate, min: d.type==='addon' ? f.pmt : (d.payment>0?d.payment:f.setPmt)
+    id:d.id, name:debtName(d), bal:f.outstanding, rate:f.monthlyRate, min: isRoll(d) ? rollFacts(d).fee : d.type==='addon' ? f.pmt : (d.payment>0?d.payment:f.setPmt)
   }));
 }
 function simulate(items, extra=0, strategy='avalanche', rollover=true){
@@ -724,7 +724,7 @@ const monthSpent = key => monthExp(key).reduce((s,e)=>s+num(e.amount),0);
 const activeDebts = () => S.debts.filter(d=>!debtFacts(d).done);
 function debtTotals(){
   let remaining=0, outstanding=0, paid=0, monthly=0;
-  S.debts.forEach(d=>{ const f=debtFacts(d); remaining+=f.remaining; outstanding+=f.outstanding; paid+=f.paid; if(!f.done) monthly += d.type==='addon'?f.pmt:(d.payment>0?d.payment:f.setPmt); });
+  S.debts.forEach(d=>{ const f=debtFacts(d); remaining+=f.remaining; outstanding+=f.outstanding; paid+=f.paid; if(!f.done) monthly += isRoll(d) ? rollFacts(d).fee : d.type==='addon'?f.pmt:(d.payment>0?d.payment:f.setPmt); });
   return { remaining, outstanding, paid, monthly };
 }
 function currentPlan(){ return simulate(planItems(S.debts), num(S.profile.extra), S.profile.strategy, true); }
@@ -1102,7 +1102,7 @@ function lateDebts(key=monthKey()){
     const created=(d.createdAt||S.profile.startedAt||todayStr), cm=created.slice(0,7);
     for (let k=3;k>=1;k--){ const m=shiftMonth(key,-k); if (m<cm) continue;
       if (m===cm && +created.slice(8,10) > Math.min(28, +d.dueDay||1)) continue;   // added after that month's due date
-      const expected = d.type==='addon' ? f.pmt : (d.payment>0?d.payment:f.setPmt);
+      const expected = isRoll(d) ? rollFacts(d).due : d.type==='addon' ? f.pmt : (d.payment>0?d.payment:f.setPmt);
       if (d.type==='addon' && f.remN<=0) continue;
       push(m, expected - debtPaidIn(d,m)); }
   });
@@ -1165,6 +1165,60 @@ function logLateFee(fee, tgt, label, date, extra){
 }
 const overdueDaysOf = day => { const td=new Date().getDate(); return day && day<td ? td-day : 0; };
 
+/* ---------- rollover credit lines (pay in full, borrow again — e.g. Maya Easy Credit) ---------- */
+const isRoll = d => !!(d && d.rollover && d.type==='revolving' && d.lender!=='cc');
+function rollFacts(d){ const bal=Math.max(0, num(debtFacts(d).remaining)), rate=num(d.rate)||0, fee=Math.round(bal*rate)/100;
+  return { bal, rate, fee, due: Math.round((bal+fee)*100)/100, yearly: Math.round(fee*12) }; }
+// How much to borrow back: the old amount minus whatever this month can spare, in ₱500 steps.
+function rollSuggest(d, principal){
+  let spare=0; try { const bc=budgetCheck(); spare=Math.max(0, bc.safe - bc.catRoom); } catch(e){}
+  const cut=Math.min(principal, Math.floor(spare/500)*500); return { amt:Math.max(0, principal-cut), cut };
+}
+function rollPayModal(id){
+  const d=S.debts.find(x=>x.id===id); if(!d) return; const r=rollFacts(d), mk=monthKey(), paidNow=debtPaidIn(d,mk);
+  const sug=rollSuggest(d, r.bal);
+  openModal(`${mhead('Pay & borrow again')}<form id="rpForm" style="display:flex;flex-direction:column;gap:14px">
+    <div class="row" style="padding:0"><div class="lender-badge" style="background:${lenderLook(d).color}">${lenderLook(d).short}</div><div class="grow"><div class="title">${esc(debtName(d))}</div><div class="meta">Pay in full each month · ${pct(r.rate)} fee</div></div></div>
+    <div class="calc"><div><span>Borrowed</span><strong>${peso(r.bal)}</strong></div><div><span>Fee / interest (${pct(r.rate)})</span><strong class="neg">${peso(r.fee,2)}</strong></div><div><span>Amount due</span><strong>${peso(r.due,2)}</strong></div></div>
+    <div class="grid-form">
+      <label class="field">Amount paid<div class="input-wrap"><span class="prefix">₱</span><input class="input num" id="rpAmt" inputmode="decimal" value="${r.due.toFixed(2)}"></div><span class="hint">Change it if your bill shows a different amount.</span></label>
+      <label class="field">Date<input class="input" type="date" id="rpDate" value="${today()}"></label>
+      ${canPay()?`<label class="field">Paid from<select class="input" id="rpAcct">${acctOptions(defaultAcct())}</select></label>`:''}
+    </div>
+    ${acctSvcBox()}
+    ${lateFeeQ(paidNow>0?0:overdueDaysOf(+d.dueDay||0))}
+    <div style="display:flex;flex-direction:column;gap:10px;padding:12px;border-radius:12px;border:1px solid var(--line);background:var(--surface-2)">
+      <label class="row" style="padding:0;border:0;cursor:pointer"><input type="checkbox" id="rpRe" checked style="width:18px;height:18px;accent-color:var(--pine)"><span class="small" style="font-weight:600">I borrowed again after paying</span></label>
+      <div id="rpReBox" class="grid-form">
+        <label class="field">Borrowed again<div class="input-wrap"><span class="prefix">₱</span><input class="input num" id="rpReAmt" inputmode="decimal" value="${sug.amt>0?sug.amt:r.bal}"></div></label>
+        ${canPay()?`<label class="field">Went into<select class="input" id="rpReAcct">${acctOptions(defaultAcct())}</select></label>`:''}
+      </div>
+      <span class="hint" id="rpTip"></span>
+    </div>
+    <div class="modal-foot"><button type="button" class="btn" data-act="close">Cancel</button><button class="btn primary">${ico('check')}Save</button></div></form>`, m=>{
+    const q=s=>m.querySelector(s); const lf=wireLateFee(m); const asv=wireAcctSvc(m, q('#rpAcct'), q('#rpAmt'), d);
+    const tip=()=>{ const re=q('#rpRe').checked, amt=num(q('#rpReAmt').value); q('#rpReBox').hidden=!re;
+      if (!re || amt<=0){ q('#rpTip').innerHTML=`<span class="pos"><strong>You're out!</strong></span> No more ${peso(r.fee,2)} fee every month.`; return; }
+      const fee=Math.round(amt*r.rate)/100, saved=Math.max(0, r.fee-fee), less=Math.max(0,r.bal-amt);
+      q('#rpTip').innerHTML = less>0 ? `Borrowing ${peso(less)} less saves <strong class="pos">${peso(saved,2)}</strong> next month. Keep going and you'll stop in about <strong>${Math.ceil(amt/Math.max(1,less))} more month${Math.ceil(amt/Math.max(1,less))===1?'':'s'}</strong>.`
+        : `Borrowing the same amount costs another <strong class="neg">${peso(fee,2)}</strong> next month (${peso(fee*12)} a year).${sug.cut>=r.bal?` <strong class="pos">Your budget can cover it this month</strong> — untick "I borrowed again" to stop for good.`:sug.cut>0?` This month you can spare about ${peso(sug.cut)} — try borrowing <strong>${peso(sug.amt)}</strong>.`:' Even ₱500 less each time helps you stop sooner.'}`; };
+    q('#rpRe').onchange=tip; q('#rpReAmt').addEventListener('input',tip); tip();
+    q('#rpForm').onsubmit=e=>{ e.preventDefault(); const amt=num(q('#rpAmt').value); if (amt<=0) return toast('Enter the amount you paid.'); if (!lf.ok()) return; if (commitCheck()) return;
+      const date=q('#rpDate').value||today(), k=date.slice(0,7), pa=q('#rpAcct')?.value||'';
+      const fee=Math.min(amt, r.fee), principal=Math.max(0, amt-fee);
+      // the fee is real spending; the principal just goes back to the lender
+      (S.expenses[k]=S.expenses[k]||[]).push({id:uid(), amount:Math.round(fee*100)/100, date, cat:'fees', note:`${debtName(d)} fee`, debtId:d.id, rollFee:true, ...(pa?{acct:pa}:{})});
+      if (pa && principal>0) S.transfers=(S.transfers||[]).concat([{id:uid(), date, from:pa, to:'', amount:principal, note:'Paid back · '+debtName(d)}]);
+      d.balance=Math.max(0, num(d.balance)-principal); d.paidTotal=num(d.paidTotal)+principal; d.monthPaid={...(d.monthPaid||{}), [k]: num((d.monthPaid||{})[k]) + amt};
+      const lfee=lf.get(); logLateFee(lfee, {acct:pa}, debtName(d), date, {lateDebt:d.id});
+      const sfee=asv.get(); logAcctSvc(sfee, pa, debtName(d), date, {svcDebt:d.id}, asv.mode()==='pct'?num(asv.val()):0);
+      let re=0; if (q('#rpRe').checked){ re=Math.max(0, num(q('#rpReAmt').value)); if (re>0){ d.balance=num(d.balance)+re; const ra=q('#rpReAcct')?.value||''; if (ra) S.transfers=S.transfers.concat([{id:uid(), date, from:'', to:ra, amount:re, note:'Borrowed again · '+debtName(d), reborrow:d.id}]); d.rollLog=(d.rollLog||[]).concat([{date, borrowed:re}]).slice(-24); } }
+      if (!re && num(d.balance)<=0.5){ d.rollover=false; closeModal(); commit('debts'); confetti(); toast(`You're free of ${debtName(d)}! No more monthly fee.`); return; }
+      closeModal(); commit('debts');
+      toast(re>0 ? (re<r.bal ? `Saved. You borrowed ${peso(r.bal-re)} less — next fee is ${peso(Math.round(re*r.rate)/100,2)}.` : `Saved. This month cost you ${peso(fee+lfee+sfee,2)} in fees.`) : 'Payment saved.'); };
+  });
+}
+
 function monthChecklist(key=monthKey()){
   const items=[];
   S.profile.bills.filter(b=>billDueIn(b,key)).forEach(b=>billParts(b).forEach((p,i)=>{
@@ -1177,6 +1231,8 @@ function monthChecklist(key=monthKey()){
     items.push({ kind:'oneoff', id:o.id, name:o.name, day:+o.day||0, expected:num(o.amount), paid, done:pe.length>0, from:o.payFrom||'', expId:pe[pe.length-1]?.id }); });
   S.debts.forEach(d=>{ const f=debtFacts(d), paid=debtPaidIn(d,key);
     if (f.done && paid<=0) return;
+    if (isRoll(d)){ const r=rollFacts(d); const exp = paid>0 ? paid : r.due; if (r.bal<=0.5 && paid<=0) return;
+      items.push({ kind:'debt', roll:true, id:d.id, name:debtName(d), day:+d.dueDay||0, expected:exp, cost:r.fee, fee:r.fee, bal:r.bal, paid, done: paid>=r.due-1 || (paid>0 && paid>=exp) }); return; }
     let expected = d.type==='schedule' ? (key===monthKey() ? f.unpaid.filter(e=>e.month===key).reduce((s,e)=>s+e.left,0) : f.pmt) + paid : d.type==='addon' ? f.pmt : (d.payment>0?d.payment:f.setPmt);
     if (expected<=0 && paid<=0) return;
     items.push({ kind:'debt', id:d.id, name:debtName(d), day:+d.dueDay||0, expected, paid, done: paid>=expected-1 || f.done });
@@ -1192,7 +1248,7 @@ function monthChecklist(key=monthKey()){
   const lateRank = x => (x.kind==='late'||x.kind==='latebill') ? 2 : x.overdue ? 1 : 0;
   items.sort((a,b)=>(a.done-b.done) || (lateRank(b)-lateRank(a)) || ((a.day||99)-(b.day||99)));
   const spendItems=items.filter(x=>x.kind!=='move'), moves=items.filter(x=>x.kind==='move');
-  const toPay=spendItems.filter(x=>!x.done).reduce((s,x)=>s+Math.max(0,x.expected-x.paid),0);
+  const toPay=spendItems.filter(x=>!x.done).reduce((s,x)=>s+(x.roll ? x.cost : Math.max(0,x.expected-x.paid)),0);
   const paid=spendItems.reduce((s,x)=>s+x.paid,0), planned=spendItems.reduce((s,x)=>s+(x.done?x.paid:Math.max(x.expected,x.paid)),0);
   const toMove=moves.filter(x=>!x.done).reduce((s,x)=>s+x.expected,0);
   return { items, toPay, paid, planned, toMove, skipped };
@@ -1386,7 +1442,7 @@ function monthPanel(){
   const isLate = x => x.kind==='late'||x.kind==='latebill';
   const row = x => `<div class="row">
       <button type="button" class="cat-ico check-btn ${x.done?'is-done':''}" ${x.kind==='move' ? (x.done?`data-act="edit-move" data-id="${x.trId}" aria-label="Moved — change or undo"`:`data-act="pay-bill" data-id="${x.id}" data-part="${x.part||0}" aria-label="Move ${esc(x.name)}"`) : x.done ? (x.expId?`data-act="edit-expense" data-id="${x.expId}" aria-label="Paid — change amount or undo"`:'disabled aria-label="Paid"') : `data-act="${actOf(x)}" data-id="${x.id}" data-part="${x.part||0}" data-month="${x.month||''}" aria-label="Mark ${esc(x.name)} as paid" ${isLate(x)||x.overdue?'style="background:var(--bad-soft);color:var(--bad);border-color:var(--bad)"':''}`}>${x.done?ico('check','style="width:18px;height:18px"'):isLate(x)?ico('alert','style="width:18px;height:18px"'):`<span class="num">${x.day||'—'}</span>`}</button>
-      <div class="grow"><div class="title" style="${x.done?'text-decoration:line-through;text-decoration-color:var(--ink-3);color:var(--ink-2)':''}">${esc(x.name)}</div><div class="meta">${x.kind==='move'?'Transfer'+(x.to&&acctName(x.to)?' to '+esc(acctName(x.to)):'')+' · not spending':x.kind==='latebill'?`<span class="neg">Unpaid ${x.monLabel} bill · ${x.daysLate} day${x.daysLate===1?'':'s'} overdue</span>`:x.kind==='late'?`<span class="neg">Missed ${x.monLabel} payment · ${x.daysLate} day${x.daysLate===1?'':'s'} late</span> · ${peso(x.missed)} + ≈${peso(x.charges)} late charges`:x.kind==='debt'?'Debt':x.kind==='oneoff'?'This month only':x.every>1?FREQ_LABEL[x.every]+' bill':'Monthly bill'}${x.overdue?` · <span class="neg" style="font-weight:600">Overdue ${x.overdue} day${x.overdue===1?'':'s'}</span> (due ${MONTHS[new Date().getMonth()]} ${x.day})`:x.day?' · due '+MONTHS[new Date().getMonth()]+' '+x.day:''}${x.kind!=='move'&&x.from?(x.from.startsWith('debt:')?' · on '+esc(debtName(S.debts.find(d=>d.id===x.from.slice(5))||{})):acctName(x.from)?' · from '+esc(acctName(x.from)):''):''}${x.done&&Math.abs(x.paid-x.expected)>=1?` · <span class="${x.paid>x.expected?'neg':'pos'}">${x.paid>x.expected?'+':'−'}${peso(Math.abs(x.paid-x.expected))} vs ${x.kind==='oneoff'?'planned':'usual'}</span>`:''}</div></div>
+      <div class="grow"><div class="title" style="${x.done?'text-decoration:line-through;text-decoration-color:var(--ink-3);color:var(--ink-2)':''}">${esc(x.name)}</div><div class="meta">${x.kind==='move'?'Transfer'+(x.to&&acctName(x.to)?' to '+esc(acctName(x.to)):'')+' · not spending':x.kind==='latebill'?`<span class="neg">Unpaid ${x.monLabel} bill · ${x.daysLate} day${x.daysLate===1?'':'s'} overdue</span>`:x.kind==='late'?`<span class="neg">Missed ${x.monLabel} payment · ${x.daysLate} day${x.daysLate===1?'':'s'} late</span> · ${peso(x.missed)} + ≈${peso(x.charges)} late charges`:x.kind==='debt'&&x.roll?`Pay ${peso(x.expected)} & borrow again · <span class="neg">costs ${peso(x.fee,2)}</span>`:x.kind==='debt'?'Debt':x.kind==='oneoff'?'This month only':x.every>1?FREQ_LABEL[x.every]+' bill':'Monthly bill'}${x.overdue?` · <span class="neg" style="font-weight:600">Overdue ${x.overdue} day${x.overdue===1?'':'s'}</span> (due ${MONTHS[new Date().getMonth()]} ${x.day})`:x.day?' · due '+MONTHS[new Date().getMonth()]+' '+x.day:''}${x.kind!=='move'&&x.from?(x.from.startsWith('debt:')?' · on '+esc(debtName(S.debts.find(d=>d.id===x.from.slice(5))||{})):acctName(x.from)?' · from '+esc(acctName(x.from)):''):''}${x.done&&Math.abs(x.paid-x.expected)>=1?` · <span class="${x.paid>x.expected?'neg':'pos'}">${x.paid>x.expected?'+':'−'}${peso(Math.abs(x.paid-x.expected))} vs ${x.kind==='oneoff'?'planned':'usual'}</span>`:''}</div></div>
       <span class="amount ${x.done?'faint':''}">${peso(x.done?x.paid:Math.max(0,x.expected-x.paid))}</span>
       ${x.kind==='move' ? (x.done?`<button class="btn sm ghost" data-act="edit-move" data-id="${x.trId}">Edit</button>`:`<button class="icon-btn" data-act="skip-item" data-kind="move" data-id="${x.id}" data-part="${x.part||0}" aria-label="Skip ${esc(x.name)} this month" title="Skip this month">${ico('x')}</button><button class="btn sm" data-act="pay-bill" data-id="${x.id}" data-part="${x.part||0}">Move</button>`) : x.done ? (x.expId?`<button class="btn sm ghost" data-act="edit-expense" data-id="${x.expId}">Edit</button>`:'') : `${x.kind==='oneoff'?`<button class="icon-btn" data-act="edit-oneoff" data-id="${x.id}" aria-label="Edit">${ico('edit')}</button>`:''}${isLate(x)?'':`<button class="icon-btn" data-act="skip-item" data-kind="${x.kind}" data-id="${x.id}" data-part="${x.part||0}" aria-label="Can't pay ${esc(x.name)} this month" title="Can't pay this month">${ico('x')}</button>`}<button class="btn sm ${isLate(x)||x.overdue?'primary':''}" data-act="${actOf(x)}" data-id="${x.id}" data-part="${x.part||0}" data-month="${x.month||''}">Pay</button>`}
     </div>`;
@@ -2020,15 +2076,15 @@ function vDebts(){
   const card = d => { if (d.type==='schedule') return schedCard(d); const f=debtFacts(d), L=lenderLook(d); const prog = d.type==='addon' ? (d.paidMonths||0)/d.term : (d.startBalance? Math.max(0,1-d.balance/d.startBalance):0);
     return `<article class="debt ${f.done?'paid':''}">
       <div class="debt-top"><div class="lender-badge" style="background:${L.color}">${f.done?ico('check','style="width:20px;height:20px"'):L.short}</div>
-        <div style="flex:1;min-width:0"><div class="debt-name">${esc(debtName(d))}</div><div class="debt-sub">${d.type==='addon'?'Installment · add-on '+pct(d.rate)+'/mo':'Revolving · '+pct(d.rate)+'/mo'} · ${pct(f.monthlyRate*100)} effective</div>${linkedChip(d)}</div>
+        <div style="flex:1;min-width:0"><div class="debt-name">${esc(debtName(d))}</div><div class="debt-sub">${isRoll(d)?'Pay in full & borrow again · '+pct(d.rate)+' fee/mo':d.type==='addon'?'Installment · add-on '+pct(d.rate)+'/mo':'Revolving · '+pct(d.rate)+'/mo'} · ${pct(f.monthlyRate*100)} effective</div>${linkedChip(d)}${isRoll(d)&&!f.done?(()=>{ const r=rollFacts(d), lg=d.rollLog||[]; const first=lg.length?num(lg[0].borrowed):r.bal; return `<span class="chip bad" style="margin-top:6px;white-space:normal">Costs ${peso(r.fee,2)}/mo · ${peso(r.yearly)}/yr just to keep borrowing</span>${lg.length>1&&first>r.bal?`<span class="chip good" style="margin-top:6px">${peso(first-r.bal)} less than when you started</span>`:''}`; })():''}</div>
         <button class="icon-btn" data-act="edit-debt" data-id="${d.id}" aria-label="Edit">${ico('edit')}</button></div>
       <div class="debt-figs">
         <div><span>${d.type==='addon'?'Left to pay':'Balance'}</span><strong>${peso(f.remaining)}</strong></div>
-        <div><span>Monthly</span><strong>${f.done?'—':peso(d.type==='addon'?f.pmt:(d.payment||f.setPmt))}</strong></div>
+        <div><span>${isRoll(d)?'Due monthly':'Monthly'}</span><strong>${f.done?'—':peso(isRoll(d)?rollFacts(d).due:d.type==='addon'?f.pmt:(d.payment||f.setPmt))}</strong></div>
         <div><span>${d.type==='addon'?'Months left':'Due'}</span><strong>${d.type==='addon'?f.remN+' of '+d.term:(d.dueDay?ordinal(d.dueDay):'—')}</strong></div>
       </div>
       <div><div class="bar"><i style="width:${Math.round(prog*100)}%;background:${f.done?'var(--good)':L.color}"></i></div><div style="display:flex;justify-content:space-between;margin-top:6px" class="small"><span class="faint">${Math.round(prog*100)}% paid</span><span class="faint">${d.type==='revolving'&&f.pending?'incl. '+peso(f.pending)+' new purchases · ':''}${d.type==='revolving'&&num(d.limit)?peso(Math.max(0,num(d.limit)-f.remaining))+' available · ':''}${d.type==='revolving'&&!f.done?'Interest now ≈ '+peso(f.interestNow)+'/mo':d.type==='addon'?'Total interest '+peso(f.totalInterest):''}</span></div></div>
-      ${f.done?`<span class="chip good" style="align-self:flex-start">${ico('trophy','style="width:14px;height:14px"')} Paid off</span>`:`<div class="debt-actions"><button class="btn sm primary" data-act="pay-debt" data-id="${d.id}">${ico('check')}Log payment</button>${d.type==='revolving'?`<button class="btn sm" data-act="edit-debt" data-id="${d.id}">Update balance</button>`:''}</div>`}
+      ${f.done?`<span class="chip good" style="align-self:flex-start">${ico('trophy','style="width:14px;height:14px"')} Paid off</span>`:`<div class="debt-actions"><button class="btn sm primary" data-act="pay-debt" data-id="${d.id}">${ico('check')}${isRoll(d)?'Pay & borrow again':'Log payment'}</button>${d.type==='revolving'?`<button class="btn sm" data-act="edit-debt" data-id="${d.id}">Update balance</button>`:''}</div>`}
     </article>`; };
   return `
   <div class="topbar"><div><div class="eyebrow">Everything you owe</div><h1>Debts</h1><div class="sub muted">Sorted by true monthly cost, most expensive first.</div></div><button class="btn gold" data-act="add-debt">${ico('plus')}Add debt</button></div>
@@ -2401,7 +2457,8 @@ function debtModal(id){
         <label class="field">${both?'Balance besides the installment':'Current balance'}<div class="input-wrap"><span class="prefix">₱</span><input class="input num" id="fB" inputmode="decimal" required value="${v('balance')}"></div></label>
         <label class="field">You plan to pay on it monthly<div class="input-wrap"><span class="prefix">₱</span><input class="input num" id="fPay" inputmode="decimal" value="${v('payment')}" placeholder="Suggested below"></div></label>
         <label class="field">Credit limit <span class="hint">optional</span><div class="input-wrap"><span class="prefix">₱</span><input class="input num" id="fL" inputmode="decimal" value="${v('limit')}"></div></label>
-      </div>`; };
+      </div>
+      ${!both && $m('#dLender') && $m('#dLender').value!=='cc' ? `<label class="row" style="padding:10px 12px;cursor:pointer;border:1px solid var(--line);border-radius:12px;align-items:flex-start"><input type="checkbox" id="fRoll" ${st.rollover?'checked':''} style="width:18px;height:18px;accent-color:var(--pine);margin-top:2px"><span class="small"><strong>I pay it in full every month, then borrow again</strong><br><span class="faint">For credit lines like Maya Easy Credit: you pay the whole amount due plus the fee, then loan the amount again. Kaban counts only the fee as your monthly cost and helps you borrow less each time.</span></span></label>`:''}`; };
     function fields(){
       planUI();
       const p=prodOf(), md=mode();
@@ -2423,7 +2480,7 @@ function debtModal(id){
     function readBack(){ const has=s=>!!$m(s), g=s=>$m(s).value;
       if(has('#fP')) st.principal=g('#fP'); if(has('#fN')) st.term=g('#fN'); if(has('#fPaid')) st.paidMonths=g('#fPaid'); if(has('#fAm')) st.amort=g('#fAm'); if(has('#fIR')) st.instRate=g('#fIR');
       if(schedCtl && has('#schedBox')) st.schedule=schedCtl.get();
-      if(has('#fB')) st.balance=g('#fB'); if(has('#fPay')) st.payment=g('#fPay'); if(has('#fL')) st.limit=g('#fL'); if(has('#fDue')) st.dueDay=g('#fDue'); }
+      if(has('#fB')) st.balance=g('#fB'); if(has('#fRoll')) st.rollover=$m('#fRoll').checked; if(has('#fPay')) st.payment=g('#fPay'); if(has('#fL')) st.limit=g('#fL'); if(has('#fDue')) st.dueDay=g('#fDue'); }
     function instCalc(r){ const P=num($m('#fP').value), n=Math.round(num($m('#fN').value)), paid=Math.round(num($m('#fPaid').value)), am=num($m('#fAm').value);
       const pmt=am>0?am:addonPmt(P,r,n); return {P,n,paid,pmt,e:eirFromAddon(r,n),ok:P>0&&n>0}; }
     function revCalc(r){ const B=num($m('#fB').value), pay=num($m('#fPay').value), i=B*r/100, sugg=Math.ceil(Math.max(500,B*0.05+i)/50)*50;
@@ -2454,7 +2511,7 @@ function debtModal(id){
     $m('#dForm').onsubmit=e=>{ e.preventDefault(); readBack();
       const md=mode(), lender=$m('#dLender').value, product=$m('#dProd').value, nickname=$m('#dNick').value.trim(), dueDay=+st.dueDay||0;
       const mkInst = (rate, extra) => { const r={ lender, product, nickname, type:'addon', rate, dueDay, principal:num(st.principal), term:Math.max(1,Math.round(num(st.term))), paidMonths:Math.max(0,Math.round(num(st.paidMonths))), amort:num(st.amort)||0, ...extra }; if (r.paidMonths>r.term) r.paidMonths=r.term; return r; };
-      const mkRev = (rate, extra, prev) => { const bal=num(st.balance); return { lender, product, nickname, type:'revolving', rate, dueDay, balance:bal, payment:num(st.payment)||0, limit:num(st.limit)||0, paidTotal:prev?.paidTotal||0, startBalance: prev && prev.type==='revolving' ? Math.max(prev.startBalance||0, bal) : bal, ...extra }; };
+      const mkRev = (rate, extra, prev) => { const bal=num(st.balance); return { lender, product, nickname, type:'revolving', rate, dueDay, balance:bal, payment:num(st.payment)||0, limit:num(st.limit)||0, ...(st.rollover && lender!=='cc' && md!=='both' ? {rollover:true} : {}), paidTotal:prev?.paidTotal||0, startBalance: prev && prev.type==='revolving' ? Math.max(prev.startBalance||0, bal) : bal, ...extra }; };
       if (md==='schedule'){ if (!(st.schedule||[]).length) return toast('Add at least one month with an amount.'); if (lender==='person' && !nickname) return toast('Enter who you owe.'); }
       if ((md==='installment'||md==='both') && num(st.principal)<=0) return toast(isCardPlan()?'Enter the amount converted to installment.':'Enter the loan amount.');
       if ((md==='balance'||md==='both') && st.balance==='' ) return toast('Enter the balance (0 if none).');
@@ -2565,7 +2622,7 @@ document.addEventListener('click', e=>{
     case 'exp-month': EXP_MONTH=shiftMonth(EXP_MONTH,+b.dataset.k); render(); break;
     case 'add-debt': debtModal(); break;
     case 'edit-debt': debtModal(id); break;
-    case 'pay-debt': $('.toast')&&($('.toast').hidden=true); payDebtModal(id, num(b.dataset.amt||0)); break;
+    case 'pay-debt': $('.toast')&&($('.toast').hidden=true); if (isRoll(S.debts.find(x=>x.id===id))) { rollPayModal(id); break; } payDebtModal(id, num(b.dataset.amt||0)); break;
     case 'pay-late': payDebtModal(id, 0, b.dataset.part); break;
     case 'pay-latebill': payBillModal(id, +(b.dataset.part||0), b.dataset.month); break;
     case 'latebill-done': { if (commitCheck()) return; const bl=S.profile.bills.find(x=>x.id===id); if(!bl) break; if (b.dataset.confirm!=='1'){ b.dataset.confirm='1'; b.textContent='Tap again — it won\'t be logged as spending'; break; }
